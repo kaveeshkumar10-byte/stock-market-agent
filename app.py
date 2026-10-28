@@ -4,6 +4,41 @@ import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
 
+import requests
+import streamlit as st
+
+st.subheader("Telegram Notification Test")
+
+if st.button("Send Test Telegram Message"):
+    try:
+        bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
+        chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+        response = requests.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": (
+                    "Stock Market Agent\n\n"
+                    "Telegram notifications are working!\n"
+                    "Paper trading mode: ON\n"
+                    "Trading budget: ₹10,000 per day\n"
+                    "No real trades will be placed."
+                ),
+            },
+            timeout=15,
+        )
+
+        if response.ok and response.json().get("ok"):
+            st.success("Test notification sent! Check Telegram.")
+        else:
+            st.error("Telegram could not send the message. Check your Secrets.")
+    except Exception as e:
+        st.error(f"Notification failed: {e}")
+
+
 st.set_page_config(
     page_title="Stock Agent",
     page_icon="📈",
