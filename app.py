@@ -15,6 +15,8 @@ if st.button("Send Test Telegram Message"):
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
 
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        st.write("Telegram URL format:", url.split("/")[2], "/bot<TOKEN>/sendMessage")
+        st.write("Token loaded:", bool(bot_token), "Length:", len(bot_token))
 
         response = requests.post(
             url,
