@@ -34,7 +34,9 @@ if st.button("Send Test Telegram Message"):
         if response.ok and response.json().get("ok"):
             st.success("Test notification sent! Check Telegram.")
         else:
-            st.error("Telegram could not send the message. Check your Secrets.")
+    st.error(f"Telegram API error: {response.status_code}")
+    st.code(response.text)
+            
     except Exception as e:
         st.error(f"Notification failed: {e}")
 
