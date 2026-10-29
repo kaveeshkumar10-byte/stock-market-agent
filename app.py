@@ -1,4 +1,5 @@
-    c4.metric("Agent signal", selected_signal)
+import streamlit as st
+   c4.metric("Agent signal", selected_signal)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=selected_df.index, y=selected_df["Close"], name="Adjusted close"))
