@@ -5,6 +5,79 @@ import yfinance as yf
 import plotly.graph_objects as go
 import requests
 
+
+# ---------------- SUPABASE DATABASE ----------------
+
+from supabase import create_client
+from datetime import date, datetime
+
+@st.cache_resource
+def get_supabase_client():
+    return create_client(
+        st.secrets["SUPABASE_URL"].strip(),
+        st.secrets["SUPABASE_SECRET_KEY"].strip()
+    )
+
+
+def load_portfolio():
+    """Load the saved paper-trading portfolio."""
+    client = get_supabase_client()
+
+    result = (
+        client.table("paper_portfolio")
+        .select("*")
+        .eq("id", 1)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data:
+        return result.data[0]
+
+    initial_portfolio = {
+        "id": 1,
+        "cash_balance": 10000,
+        "holdings": {},
+        "last_budget_reset": date.today().isoformat(),
+        "daily_spent": 0
+    }
+
+    client.table("paper_portfolio").insert(
+        initial_portfolio
+    ).execute()
+
+    return initial_portfolio
+
+
+def save_portfolio(cash, holdings, daily_spent):
+    """Persist cash, holdings and daily spending."""
+    client = get_supabase_client()
+
+    client.table("paper_portfolio").upsert({
+        "id": 1,
+        "cash_balance": float(cash),
+        "holdings": holdings,
+        "last_budget_reset": date.today().isoformat(),
+        "daily_spent": float(daily_spent),
+        "updated_at": datetime.now().astimezone().isoformat()
+    }).execute()
+
+
+def save_trade(trade):
+    """Persist one simulated trade."""
+    client = get_supabase_client()
+
+    client.table("paper_trades").insert({
+        "trade_time": trade["Time"],
+        "symbol": trade["Stock"],
+        "action": trade["Action"],
+        "quantity": int(trade["Quantity"]),
+        "price": float(trade["Price"]),
+        "trade_value": float(trade["Value"]),
+        "pnl": float(trade["P&L"]),
+        "reason": str(trade["Reason"])
+    }).execute()
+
 # Page configuration must come before other Streamlit UI commands
 st.set_page_config(
     page_title="Stock Agent",
