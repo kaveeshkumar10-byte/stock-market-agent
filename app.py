@@ -360,7 +360,102 @@ def execute_decision(symbol, action, price, reason, cash, holdings, spent, trade
 
     return cash, holdings, spent, trades, "HOLD: no trade."
 
+def backtest_strategy(data, initial_cash=10000.0, fee_bps=10, slippage_bps=10):
+    """
+    Educational daily backtest.
+    Signal is computed using day i data; simulated execution is at day i+1 close.
+    Fee/slippage are approximate assumptions, not broker-specific charges.
+    """
+    if data is None or data.empty or "Close" not in data.columns:
+        return None, "No usable price history."
 
+    df = data.copy().dropna(subset=["Close"])
+    if len(df) < 60:
+        return None, "At least 60 daily rows are recommended."
+
+    df["SMA20"] = df["Close"].rolling(20).mean()
+    df["SMA50"] = df["Close"].rolling(50).mean()
+    change = df["Close"].diff()
+    gains = change.clip(lower=0)
+    losses = -change.clip(upper=0)
+    avg_gain = gains.rolling(14).mean()
+    avg_loss = losses.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    cash = float(initial_cash)
+    quantity = 0
+    entry_cost = 0.0
+    trades = []
+    equity_rows = []
+    daily_spend = {}
+    fee_rate = fee_bps / 10000.0
+    slip_rate = slippage_bps / 10000.0
+
+    for i in range(1, len(df) - 1):
+        signal_row = df.iloc[i]
+        exec_row = df.iloc[i + 1]
+        signal_date = df.index[i]
+        exec_date = df.index[i + 1]
+        price = float(exec_row["Close"])
+        sma20 = signal_row["SMA20"]
+        sma50 = signal_row["SMA50"]
+        rsi = signal_row["RSI"]
+
+        if pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi) or price <= 0:
+            equity_rows.append({"Date": exec_date, "Equity": cash + quantity * price})
+            continue
+
+        action = "HOLD"
+        reason = "No strategy condition met."
+
+        if quantity == 0 and sma20 > sma50 and 35 <= rsi <= 68:
+            action = "BUY"
+            reason = "SMA20 > SMA50 and RSI in 35–68 range."
+        elif quantity > 0 and (sma20 < sma50 or rsi >= 75):
+            action = "SELL"
+            reason = "Trend reversal or RSI exit threshold."
+
+        date_key = str(pd.Timestamp(exec_date).date())
+        daily_spend.setdefault(date_key, 0.0)
+
+        if action == "BUY" and quantity == 0:
+            execution_price = price * (1 + slip_rate)
+            remaining = max(0.0, 10000.0 - daily_spend[date_key])
+            affordable = min(cash, remaining)
+            qty = int(affordable // (execution_price * (1 + fee_rate)))
+
+            if qty > 0:
+                gross = qty * execution_price
+                fee = gross * fee_rate
+                total_cost = gross + fee
+                cash -= total_cost
+                daily_spend[date_key] += total_cost
+                quantity = qty
+                entry_cost = total_cost
+                trades.append({
+                    "Date": str(pd.Timestamp(exec_date).date()),
+                    "Signal date": str(pd.Timestamp(signal_date).date()),
+                    "Action": "BUY",
+                    "Price": round(execution_price, 2),
+                    "Quantity": qty,
+                    "Fees": round(fee, 2),
+                    "P&L": 0.0,
+                    "Reason": reason
+                })
+
+        elif action == "SELL" and quantity > 0:
+            execution_price = price * (1 - slip_rate)
+            gross = quantity * execution_price
+            fee = gross * fee_rate
+            proceeds = gross - fee
+            pnl = proceeds - entry_cost
+            cash += proceeds
+            trades.append({
+                "Date": str(pd.Timestamp(exec_date).date()),
+                "Signal date": str(pd.Timestamp(signal_date).date()),
+                "Action": "SELL",
+                "Price": round(execution_price, 2),
 # ============================================================
 # APPLICATION
 # ============================================================
@@ -639,3 +734,66 @@ st.caption(
     "Scheduled scans and automatic scheduled reports require a separate "
     "background worker, which is the next implementation step."
 )
+
+# ============================================================
+# BACKTEST DASHBOARD
+# ============================================================
+st.divider()
+st.header("Historical Strategy Backtest")
+st.caption(
+    "Historical simulation only. Results do not predict future performance."
+)
+
+backtest_period = st.selectbox(
+    "Backtest historical period",
+    ["1y", "2y", "5y"],
+    index=1,
+    key="backtest_period"
+)
+
+if st.button("Run Historical Backtest"):
+    with st.spinner("Testing strategy on historical data..."):
+        try:
+            historical = download_data(
+                selected_symbol,
+                backtest_period,
+                "1d"
+            )
+
+            results, error = backtest_strategy(
+                historical,
+                initial_cash=10000,
+                fee_bps=10,
+                slippage_bps=10
+            )
+
+            if error:
+                st.warning(error)
+            else:
+                st.subheader(f"Results — {selected_symbol}")
+                st.json(results["summary"])
+
+                st.write("Simulated trades")
+                if results["trades"].empty:
+                    st.info("No trades were triggered during this period.")
+                else:
+                    st.dataframe(
+                        results["trades"],
+                        use_container_width=True
+                    )
+
+                st.write("Portfolio equity over time")
+                st.line_chart(
+                    results["equity"].set_index("Date")["Equity"]
+                )
+
+                st.write("Drawdown over time (%)")
+                st.line_chart(
+                    results["equity"].set_index("Date")["DrawdownPct"]
+                )
+
+        except Exception as error:
+            st.error(
+                f"Backtest failed: {type(error).__name__}: {error}"
+            )
+
