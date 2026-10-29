@@ -7,30 +7,21 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+
 st.subheader("Telegram Notification Test")
 
 if st.button("Send Test Telegram Message"):
-    try:
-        bot_token = st.secrets["TELEGRAM_BOT_TOKEN"]
-        chat_id = st.secrets["TELEGRAM_CHAT_ID"]
+    success = send_telegram_message(
+        "Stock Market Agent\n\n"
+        "Telegram notifications are working!\n"
+        "Mode: Paper Trading\n"
+        "Daily budget: Rs. 10,000\n"
+        "Real trades: Disabled"
+    )
 
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-       
+    if success:
+        st.success("Test notification sent! Check Telegram.")
 
-        response = requests.post(
-            url,
-            json={
-                "chat_id": chat_id,
-                "text": (
-                    "Stock Market Agent\n\n"
-                    "Telegram notifications are working!\n"
-                    "Paper trading mode: ON\n"
-                    "Trading budget: ₹10,000 per day\n"
-                    "No real trades will be placed."
-                ),
-            },
-            timeout=15,
-        )
 
         if response.ok and response.json().get("ok"):
             st.success("Test notification sent! Check Telegram.")
