@@ -424,6 +424,13 @@ def main():
         trades = load_trades()
         symbols = load_stock_symbols()
 
+        held_symbols = [
+            symbol[:-3] if symbol.endswith(".NS") else symbol
+            for symbol in holdings.keys()
+]
+
+# Scan the normal watchlist plus every currently open holding.
+        symbols = list(dict.fromkeys(symbols + held_symbols))
         for raw_symbol in symbols:
             ticker = raw_symbol if raw_symbol.endswith(".NS") else raw_symbol + ".NS"
 
