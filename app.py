@@ -448,3 +448,178 @@ if st.sidebar.button("Analyze Stock", type="primary") or True:
                 "Check your internet connection, stock symbol, "
                 "and whether market data is available."
             )
+
+# ---------------- PAPER TRADING ----------------
+
+from datetime import date, datetime
+
+st.divider()
+st.header("💹 Paper Trading")
+st.caption(
+    "Simulation only. Prices use the latest available historical "
+    "close, not live executable market prices."
+)
+
+DAILY_BUDGET = 10_000.0
+
+# Initialize temporary session records
+if "paper_date" not in st.session_state:
+    st.session_state.paper_date = date.today()
+
+if st.session_state.paper_date != date.today():
+    st.session_state.paper_date = date.today()
+    st.session_state.daily_spent = 0.0
+
+if "daily_spent" not in st.session_state:
+    st.session_state.daily_spent = 0.0
+
+if "paper_cash" not in st.session_state:
+    st.session_state.paper_cash = DAILY_BUDGET
+
+if "paper_holdings" not in st.session_state:
+    st.session_state.paper_holdings = {}
+
+if "paper_trades" not in st.session_state:
+    st.session_state.paper_trades = []
+
+spent = st.session_state.daily_spent
+cash = st.session_state.paper_cash
+holdings = st.session_state.paper_holdings
+trades = st.session_state.paper_trades
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Daily budget", f"₹{DAILY_BUDGET:,.0f}")
+m2.metric("Budget used today", f"₹{spent:,.2f}")
+m3.metric("Simulated cash", f"₹{cash:,.2f}")
+
+if "price" in locals() and price > 0:
+    st.write(f"Selected stock: **{symbol}**")
+    st.write(f"Reference price: **₹{price:,.2f}**")
+
+    quantity = st.number_input(
+        "Quantity to buy",
+        min_value=1,
+        max_value=10000,
+        value=1,
+        step=1,
+        key="paper_quantity"
+    )
+
+    cost = float(quantity) * float(price)
+
+    st.write(f"Estimated purchase value: ₹{cost:,.2f}")
+
+    if st.button("Simulate BUY", key="paper_buy"):
+        already_held = symbol in holdings
+        remaining_budget = DAILY_BUDGET - spent
+
+        if already_held:
+            st.warning(
+                "You already hold this stock. Sell the existing "
+                "position before opening another."
+            )
+        elif cost > remaining_budget:
+            st.error("This purchase exceeds the remaining daily budget.")
+        elif cost > cash:
+            st.error("Insufficient simulated cash.")
+        else:
+            holdings[symbol] = {
+                "quantity": int(quantity),
+                "entry_price": float(price),
+                "entry_time": datetime.now().isoformat(timespec="seconds")
+            }
+
+            st.session_state.paper_cash -= cost
+            st.session_state.daily_spent += cost
+
+            trade = {
+                "Time": datetime.now().isoformat(timespec="seconds"),
+                "Stock": symbol,
+                "Action": "BUY",
+                "Quantity": int(quantity),
+                "Price": float(price),
+                "Value": cost,
+                "P&L": 0.0,
+                "Reason": str(reason)
+            }
+            st.session_state.paper_trades.append(trade)
+
+            message = (
+                "📈 PAPER BUY\n"
+                f"Stock: {symbol}\n"
+                f"Quantity: {quantity}\n"
+                f"Reference price: ₹{price:.2f}\n"
+                f"Simulated value: ₹{cost:.2f}\n"
+                f"Reason: {reason}\n"
+                f"Daily budget used: ₹{spent + cost:.2f}/₹10,000\n"
+                "Simulation only; no real order placed."
+            )
+
+            send_telegram_message(message)
+            st.success("Simulated BUY recorded.")
+            st.rerun()
+
+    if symbol in holdings:
+        position = holdings[symbol]
+        st.info(
+            f"Current simulated holding: {position['quantity']} shares "
+            f"at ₹{position['entry_price']:.2f} per share."
+        )
+
+        unrealized = (
+            float(price) - position["entry_price"]
+        ) * position["quantity"]
+
+        st.metric("Estimated unrealized P&L", f"₹{unrealized:,.2f}")
+
+        if st.button("Simulate SELL", key="paper_sell"):
+            sell_quantity = position["quantity"]
+            entry_price = position["entry_price"]
+            proceeds = sell_quantity * float(price)
+            pnl = (float(price) - entry_price) * sell_quantity
+
+            st.session_state.paper_cash += proceeds
+
+            st.session_state.paper_trades.append({
+                "Time": datetime.now().isoformat(timespec="seconds"),
+                "Stock": symbol,
+                "Action": "SELL",
+                "Quantity": sell_quantity,
+                "Price": float(price),
+                "Value": proceeds,
+                "P&L": pnl,
+                "Reason": "Manual simulated exit"
+            })
+
+            del holdings[symbol]
+
+            send_telegram_message(
+                "📉 PAPER SELL\n"
+                f"Stock: {symbol}\n"
+                f"Quantity: {sell_quantity}\n"
+                f"Entry: ₹{entry_price:.2f}\n"
+                f"Exit reference: ₹{price:.2f}\n"
+                f"Simulated P&L: ₹{pnl:.2f}\n"
+                "Simulation only; no real order placed."
+            )
+
+            st.success(f"Simulated SELL recorded. P&L: ₹{pnl:.2f}")
+            st.rerun()
+
+else:
+    st.info("Analyze a stock successfully to enable paper trading.")
+
+st.subheader("Paper Trading History")
+
+if st.session_state.paper_trades:
+    history = pd.DataFrame(st.session_state.paper_trades)
+    st.dataframe(history, use_container_width=True)
+
+    realized_pnl = sum(
+        trade["P&L"]
+        for trade in st.session_state.paper_trades
+        if trade["Action"] == "SELL"
+    )
+    st.metric("Realized simulated P&L", f"₹{realized_pnl:,.2f}")
+else:
+    st.write("No simulated trades yet.")
