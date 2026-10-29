@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import requests
 from supabase import create_client
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
 # ============================================================
@@ -17,12 +18,34 @@ st.set_page_config(
     layout="wide"
 )
 
-DAILY_BUDGET = 10000.0
 INITIAL_CASH = 10000.0
+DAILY_BUDGET = 10000.0
+MAX_STOCK_ALLOCATION = INITIAL_CASH * 0.25
+STOP_LOSS_PCT = 5.0
+MAX_NEW_BUYS_PER_DAY = 2
+MARKET_TZ = ZoneInfo("Asia/Kolkata")
+
+
+def today_ist():
+    return datetime.now(MARKET_TZ).date().isoformat()
+
+
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def trade_date_ist(value):
+    try:
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.tz_convert(MARKET_TZ).date().isoformat()
+    except Exception:
+        return ""
 
 
 # ============================================================
-# SUPABASE CONNECTION
+# SUPABASE
 # ============================================================
 @st.cache_resource
 def get_supabase():
@@ -42,8 +65,8 @@ def save_portfolio(cash, holdings, spent, reset_date=None):
         "cash_balance": round(float(cash), 2),
         "holdings": holdings,
         "daily_spent": round(float(spent), 2),
-        "last_budget_reset": reset_date or date.today().isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "last_budget_reset": reset_date or today_ist(),
+        "updated_at": now_utc()
     }).execute()
 
 
@@ -66,7 +89,7 @@ def load_portfolio():
             "cash_balance": INITIAL_CASH,
             "holdings": {},
             "daily_spent": 0,
-            "last_budget_reset": date.today().isoformat()
+            "last_budget_reset": today_ist()
         }
         client.table("paper_portfolio").insert(portfolio).execute()
 
@@ -75,12 +98,9 @@ def load_portfolio():
     spent = float(portfolio.get("daily_spent") or 0)
     reset_date = str(portfolio.get("last_budget_reset") or "")
 
-    # Reset the daily allowance without resetting cash or holdings.
-    today = date.today().isoformat()
-
-    if reset_date != today:
+    if reset_date != today_ist():
         spent = 0.0
-        save_portfolio(cash, holdings, spent, today)
+        save_portfolio(cash, holdings, spent, today_ist())
 
     return cash, holdings, spent
 
@@ -122,8 +142,17 @@ def save_trade(trade):
     }).execute()
 
 
+def buys_today(trades):
+    today = today_ist()
+    return sum(
+        1 for trade in trades
+        if trade.get("Action") == "BUY"
+        and trade_date_ist(trade.get("Time", "")) == today
+    )
+
+
 # ============================================================
-# TELEGRAM NOTIFICATIONS
+# TELEGRAM
 # ============================================================
 def send_telegram(message):
     try:
@@ -220,10 +249,6 @@ def analyse_stock(data):
 # AGENT DECISION ENGINE
 # ============================================================
 def agent_decision(df, is_holding):
-    """
-    Transparent baseline strategy using historical daily data.
-    This is a rule-based strategy, not a guarantee of profit.
-    """
     if df is None or len(df) < 55:
         return "HOLD", "Insufficient historical data."
 
@@ -236,22 +261,16 @@ def agent_decision(df, is_holding):
         return "HOLD", "Indicators are not yet available."
 
     if not is_holding and sma20 > sma50 and 35 <= rsi <= 68:
-        return "BUY", (
-            "Uptrend: SMA20 is above SMA50 and RSI is "
-            "within the configured entry range."
-        )
+        return "BUY", "Uptrend and RSI within entry range."
 
-    if is_holding and sma20 < sma50:
-        return "SELL", "Exit rule: SMA20 is below SMA50."
-
-    if is_holding and rsi >= 75:
-        return "SELL", "Exit rule: RSI reached the high threshold."
+    if is_holding and (sma20 < sma50 or rsi >= 75):
+        return "SELL", "Trend reversal or RSI exit threshold."
 
     return "HOLD", "No entry or exit condition was triggered."
 
 
 # ============================================================
-# PAPER EXECUTION
+# PAPER TRADE EXECUTION WITH RISK CONTROLS
 # ============================================================
 def execute_decision(
     symbol, action, price, reason,
@@ -260,25 +279,55 @@ def execute_decision(
     if price <= 0:
         return cash, holdings, spent, trades, "Invalid reference price."
 
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp = now_utc()
+
+    # Stop-loss has priority over the normal strategy signal.
+    if symbol in holdings:
+        position = holdings[symbol]
+        entry_price = float(position["entry_price"])
+
+        if price <= entry_price * (1 - STOP_LOSS_PCT / 100):
+            action = "SELL"
+            reason = (
+                f"Stop-loss triggered: price is at least "
+                f"{STOP_LOSS_PCT:.1f}% below entry."
+            )
 
     if action == "BUY":
         if symbol in holdings:
+            return cash, holdings, spent, trades, "Position already exists."
+
+        # Limit new BUY trades across all stocks per India calendar day.
+        if buys_today(trades) >= MAX_NEW_BUYS_PER_DAY:
             return (
                 cash, holdings, spent, trades,
-                "Position already exists."
+                f"BUY blocked: daily limit of "
+                f"{MAX_NEW_BUYS_PER_DAY} new BUY trades reached."
             )
 
-        remaining_budget = max(0, DAILY_BUDGET - spent)
-        quantity = int(min(cash, remaining_budget) // price)
+        remaining_daily_budget = max(0.0, DAILY_BUDGET - spent)
+        remaining_stock_allocation = MAX_STOCK_ALLOCATION
+
+        investable = min(
+            cash,
+            remaining_daily_budget,
+            remaining_stock_allocation
+        )
+
+        quantity = int(investable // price)
 
         if quantity < 1:
             return (
                 cash, holdings, spent, trades,
-                "BUY skipped: daily budget or cash is insufficient."
+                "BUY skipped: cash, daily budget, or stock allocation "
+                "is insufficient for one share."
             )
 
         value = round(quantity * price, 2)
+
+        # Final guard against allocation or budget overrun.
+        if value > MAX_STOCK_ALLOCATION or value > remaining_daily_budget:
+            return cash, holdings, spent, trades, "Risk limit blocked BUY."
 
         trade = {
             "Time": timestamp,
@@ -301,6 +350,7 @@ def execute_decision(
         new_cash = round(cash - value, 2)
         new_spent = round(spent + value, 2)
 
+        # Persist trade and portfolio before changing local state.
         save_trade(trade)
         save_portfolio(new_cash, new_holdings, new_spent)
 
@@ -316,17 +366,14 @@ def execute_decision(
             f"Reference price: ₹{price:.2f}\n"
             f"Value: ₹{value:.2f}\n"
             f"Reason: {reason}\n"
-            "Simulation only; no real order placed."
+            "Risk controls applied. Simulation only; no real order."
         )
 
         return cash, holdings, spent, trades, f"BUY simulated: {symbol}"
 
     if action == "SELL":
         if symbol not in holdings:
-            return (
-                cash, holdings, spent, trades,
-                "No open position to sell."
-            )
+            return cash, holdings, spent, trades, "No open position to sell."
 
         position = holdings[symbol]
         quantity = int(position["quantity"])
@@ -377,7 +424,7 @@ def execute_decision(
 
 
 # ============================================================
-# HISTORICAL BACKTEST
+# BACKTEST WITH STOP-LOSS AND RISK LIMITS
 # ============================================================
 def backtest_strategy(
     data,
@@ -385,12 +432,6 @@ def backtest_strategy(
     fee_bps=10,
     slippage_bps=10
 ):
-    """
-    Educational daily backtest.
-    Uses day i indicators and simulates execution at day i+1 close.
-    Fees and slippage are estimates, not broker-specific charges.
-    """
-
     if data is None or data.empty or "Close" not in data.columns:
         return None, "No usable price history."
 
@@ -405,7 +446,6 @@ def backtest_strategy(
     change = df["Close"].diff()
     gains = change.clip(lower=0)
     losses = -change.clip(upper=0)
-
     avg_gain = gains.rolling(14).mean()
     avg_loss = losses.rolling(14).mean()
     rs = avg_gain / avg_loss.replace(0, float("nan"))
@@ -414,13 +454,16 @@ def backtest_strategy(
     cash = float(initial_cash)
     quantity = 0
     entry_cost = 0.0
-
-    trade_rows = []
+    entry_price = 0.0
+    trades = []
     equity_rows = []
     daily_spend = {}
+    daily_buys = {}
 
     fee_rate = fee_bps / 10000.0
     slip_rate = slippage_bps / 10000.0
+    max_allocation = initial_cash * 0.25
+    max_daily_budget = 10000.0
 
     for i in range(1, len(df) - 1):
         signal_row = df.iloc[i]
@@ -434,63 +477,83 @@ def backtest_strategy(
         sma50 = signal_row["SMA50"]
         rsi = signal_row["RSI"]
 
-        if (
-            pd.isna(sma20)
-            or pd.isna(sma50)
-            or pd.isna(rsi)
-            or price <= 0
-        ):
-            equity_rows.append({
-                "Date": exec_date,
-                "Equity": cash + quantity * price
-            })
+        if price <= 0:
             continue
+
+        date_key = str(pd.Timestamp(exec_date).date())
+        daily_spend.setdefault(date_key, 0.0)
+        daily_buys.setdefault(date_key, 0)
 
         action = "HOLD"
         reason = "No strategy condition met."
 
-        if quantity == 0 and sma20 > sma50 and 35 <= rsi <= 68:
-            action = "BUY"
-            reason = "SMA20 > SMA50 and RSI is in the 35–68 range."
-
-        elif quantity > 0 and (sma20 < sma50 or rsi >= 75):
+        # Stop-loss is evaluated using the next day's available close.
+        if quantity > 0 and price <= entry_price * (
+            1 - STOP_LOSS_PCT / 100
+        ):
             action = "SELL"
-            reason = "Trend reversal or RSI exit threshold."
+            reason = f"Stop-loss triggered at {STOP_LOSS_PCT:.1f}%."
 
-        date_key = str(pd.Timestamp(exec_date).date())
-        daily_spend.setdefault(date_key, 0.0)
+        elif not (
+            pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi)
+        ):
+            if quantity == 0 and sma20 > sma50 and 35 <= rsi <= 68:
+                action = "BUY"
+                reason = "SMA20 > SMA50 and RSI is in the 35–68 range."
+            elif quantity > 0 and (sma20 < sma50 or rsi >= 75):
+                action = "SELL"
+                reason = "Trend reversal or RSI exit threshold."
 
         if action == "BUY" and quantity == 0:
-            execution_price = price * (1 + slip_rate)
-            remaining = max(
-                0.0, DAILY_BUDGET - daily_spend[date_key]
-            )
-            affordable = min(cash, remaining)
+            if daily_buys[date_key] >= MAX_NEW_BUYS_PER_DAY:
+                action = "HOLD"
+                reason = "Daily BUY trade limit reached."
 
-            qty = int(
-                affordable // (execution_price * (1 + fee_rate))
-            )
+            elif daily_spend[date_key] >= max_daily_budget:
+                action = "HOLD"
+                reason = "Daily spending limit reached."
 
-            if qty > 0:
-                gross = qty * execution_price
-                fee = gross * fee_rate
-                total_cost = gross + fee
+            else:
+                execution_price = price * (1 + slip_rate)
 
-                cash -= total_cost
-                daily_spend[date_key] += total_cost
-                quantity = qty
-                entry_cost = total_cost
+                remaining_daily = max(
+                    0.0,
+                    max_daily_budget - daily_spend[date_key]
+                )
 
-                trade_rows.append({
-                    "Date": str(pd.Timestamp(exec_date).date()),
-                    "Signal date": str(pd.Timestamp(signal_date).date()),
-                    "Action": "BUY",
-                    "Price": round(execution_price, 2),
-                    "Quantity": qty,
-                    "Fees": round(fee, 2),
-                    "P&L": 0.0,
-                    "Reason": reason
-                })
+                investable = min(
+                    cash,
+                    remaining_daily,
+                    max_allocation
+                )
+
+                qty = int(
+                    investable // (execution_price * (1 + fee_rate))
+                )
+
+                if qty > 0:
+                    gross = qty * execution_price
+                    fee = gross * fee_rate
+                    total_cost = gross + fee
+
+                    cash -= total_cost
+                    daily_spend[date_key] += total_cost
+                    daily_buys[date_key] += 1
+
+                    quantity = qty
+                    entry_cost = total_cost
+                    entry_price = execution_price
+
+                    trades.append({
+                        "Date": str(pd.Timestamp(exec_date).date()),
+                        "Signal date": str(pd.Timestamp(signal_date).date()),
+                        "Action": "BUY",
+                        "Price": round(execution_price, 2),
+                        "Quantity": qty,
+                        "Fees": round(fee, 2),
+                        "P&L": 0.0,
+                        "Reason": reason
+                    })
 
         elif action == "SELL" and quantity > 0:
             execution_price = price * (1 - slip_rate)
@@ -501,7 +564,7 @@ def backtest_strategy(
 
             cash += proceeds
 
-            trade_rows.append({
+            trades.append({
                 "Date": str(pd.Timestamp(exec_date).date()),
                 "Signal date": str(pd.Timestamp(signal_date).date()),
                 "Action": "SELL",
@@ -514,6 +577,7 @@ def backtest_strategy(
 
             quantity = 0
             entry_cost = 0.0
+            entry_price = 0.0
 
         equity_rows.append({
             "Date": exec_date,
@@ -524,8 +588,11 @@ def backtest_strategy(
         return None, "Not enough valid rows to calculate equity."
 
     equity_df = pd.DataFrame(equity_rows)
-    equity_df = equity_df.drop_duplicates(subset=["Date"])
-    equity_df = equity_df.sort_values("Date").reset_index(drop=True)
+    equity_df = (
+        equity_df.drop_duplicates(subset=["Date"])
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
 
     equity_df["Peak"] = equity_df["Equity"].cummax()
     equity_df["DrawdownPct"] = (
@@ -536,27 +603,16 @@ def backtest_strategy(
     final_price = float(df["Close"].iloc[-1])
     final_equity = cash + quantity * final_price
 
-    strategy_return = (
-        (final_equity / initial_cash) - 1
-    ) * 100
+    strategy_return = (final_equity / initial_cash - 1) * 100
 
     first_price = float(df["Close"].iloc[0])
-    buy_hold_return = (
-        (final_price / first_price) - 1
-    ) * 100
+    buy_hold_return = (final_price / first_price - 1) * 100
 
-    sells = [
-        trade for trade in trade_rows
-        if trade["Action"] == "SELL"
-    ]
+    sells = [t for t in trades if t["Action"] == "SELL"]
+    wins = sum(1 for t in sells if t["P&L"] > 0)
+    win_rate = wins / len(sells) * 100 if sells else 0.0
 
-    wins = sum(1 for trade in sells if trade["P&L"] > 0)
-    win_rate = (wins / len(sells) * 100) if sells else 0.0
-
-    max_drawdown = (
-        float(equity_df["DrawdownPct"].min())
-        if not equity_df.empty else 0.0
-    )
+    max_drawdown = float(equity_df["DrawdownPct"].min())
 
     summary = {
         "Initial cash (₹)": round(initial_cash, 2),
@@ -568,13 +624,16 @@ def backtest_strategy(
         "Winning trades": wins,
         "Win rate (%)": round(win_rate, 2),
         "Open shares at end": quantity,
-        "Estimated fee per side (bps)": fee_bps,
-        "Estimated slippage per side (bps)": slippage_bps
+        "Stop-loss (%)": STOP_LOSS_PCT,
+        "Maximum allocation per stock (₹)": round(max_allocation, 2),
+        "Maximum new BUY trades per day": MAX_NEW_BUYS_PER_DAY,
+        "Fee per side (bps)": fee_bps,
+        "Slippage per side (bps)": slippage_bps
     }
 
     return {
         "summary": summary,
-        "trades": pd.DataFrame(trade_rows),
+        "trades": pd.DataFrame(trades),
         "equity": equity_df
     }, None
 
@@ -583,35 +642,30 @@ def backtest_strategy(
 # APPLICATION
 # ============================================================
 st.title("📈 Stock Analysis & Paper Trading Agent")
-st.caption(
-    "Educational prototype · Paper trading only · No real orders"
-)
+st.caption("Educational prototype · Paper trading only · No real orders")
 
 with st.expander("Telegram test"):
     if st.button("Send Test Telegram Message"):
         if send_telegram(
-            "Stock Market Agent\n"
-            "Telegram test successful.\n"
+            "Stock Market Agent\nTelegram test successful.\n"
             "Paper trading only; no real orders."
         ):
             st.success("Telegram message sent.")
 
 
-# Load persistent portfolio and history.
+# ============================================================
+# LOAD PERSISTENT DATA
+# ============================================================
 try:
     cash, holdings, spent = load_portfolio()
     trades = load_trades()
-
 except Exception as error:
     st.error("Could not load Supabase data.")
     st.caption(f"{type(error).__name__}: {error}")
     st.stop()
 
-
-# Load stock list.
 try:
     stocks = load_stocks()
-
 except Exception as error:
     st.error(f"Could not load nse_stocks.csv: {error}")
     st.stop()
@@ -623,10 +677,7 @@ except Exception as error:
 st.sidebar.header("Stock Settings")
 
 labels = stocks["LABEL"].tolist()
-reliance = stocks.index[
-    stocks["SYMBOL"] == "RELIANCE"
-].tolist()
-
+reliance = stocks.index[stocks["SYMBOL"] == "RELIANCE"].tolist()
 default_index = int(reliance[0]) if reliance else 0
 
 selected_label = st.sidebar.selectbox(
@@ -635,10 +686,7 @@ selected_label = st.sidebar.selectbox(
     index=default_index
 )
 
-selected_row = stocks.loc[
-    stocks["LABEL"] == selected_label
-].iloc[0]
-
+selected_row = stocks.loc[stocks["LABEL"] == selected_label].iloc[0]
 selected_symbol = str(selected_row["SYMBOL"]) + ".NS"
 
 period = st.sidebar.selectbox(
@@ -663,11 +711,20 @@ try:
 
     if not selected_df.empty:
         selected_price = float(selected_df["Close"].iloc[-1])
-
         selected_signal, selected_reason = agent_decision(
             selected_df,
             selected_symbol in holdings
         )
+
+        # Show a stop-loss signal on the dashboard too.
+        if selected_symbol in holdings:
+            entry = float(holdings[selected_symbol]["entry_price"])
+            if selected_price <= entry * (1 - STOP_LOSS_PCT / 100):
+                selected_signal = "SELL"
+                selected_reason = (
+                    f"Stop-loss triggered: price is at least "
+                    f"{STOP_LOSS_PCT:.1f}% below entry."
+                )
 
 except Exception as error:
     st.warning(f"Stock analysis failed: {error}")
@@ -677,98 +734,82 @@ st.subheader(f"Market Overview — {selected_symbol}")
 
 if selected_price is not None:
     latest = selected_df.iloc[-1]
-
     previous = (
         float(selected_df["Close"].iloc[-2])
-        if len(selected_df) > 1
-        else selected_price
+        if len(selected_df) > 1 else selected_price
     )
-
     change_pct = (
-        (selected_price / previous - 1) * 100
-        if previous else 0
+        (selected_price / previous - 1) * 100 if previous else 0
     )
 
     c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Latest available close",
-        f"₹{selected_price:,.2f}"
-    )
-
-    c2.metric(
-        "Previous-session change",
-        f"{change_pct:+.2f}%"
-    )
-
+    c1.metric("Latest available close", f"₹{selected_price:,.2f}")
+    c2.metric("Previous-session change", f"{change_pct:+.2f}%")
     c3.metric(
         "RSI (14)",
-        "N/A" if pd.isna(latest["RSI"])
-        else f"{latest['RSI']:.2f}"
+        "N/A" if pd.isna(latest["RSI"]) else f"{latest['RSI']:.2f}"
     )
-
     c4.metric("Agent signal", selected_signal)
 
     fig = go.Figure()
-
     fig.add_trace(go.Scatter(
         x=selected_df.index,
         y=selected_df["Close"],
         name="Closing price"
     ))
-
     fig.add_trace(go.Scatter(
         x=selected_df.index,
         y=selected_df["SMA20"],
         name="SMA20"
     ))
-
     fig.add_trace(go.Scatter(
         x=selected_df.index,
         y=selected_df["SMA50"],
         name="SMA50"
     ))
-
     fig.update_layout(
         template="plotly_white",
         xaxis_title="Date",
         yaxis_title="Adjusted price (₹)",
         hovermode="x unified"
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Agent Analysis")
     st.write(selected_reason)
 
     with st.expander("Recent historical data"):
-        st.dataframe(
-            selected_df.tail(10),
-            use_container_width=True
-        )
+        st.dataframe(selected_df.tail(10), use_container_width=True)
 
 st.caption(
-    "Reference prices use daily historical data, "
-    "not live executable quotes."
+    "Reference prices use daily historical data, not live executable quotes."
 )
 
 
 # ============================================================
-# PAPER PORTFOLIO
+# PAPER PORTFOLIO AND RISK STATUS
 # ============================================================
 st.divider()
 st.header("💹 Paper Portfolio")
 
 c1, c2, c3, c4 = st.columns(4)
-
 c1.metric("Daily spending limit", f"₹{DAILY_BUDGET:,.0f}")
 c2.metric("Budget used today", f"₹{spent:,.2f}")
 c3.metric("Simulated cash", f"₹{cash:,.2f}")
 c4.metric("Open positions", str(len(holdings)))
 
 st.info(
-    "The daily spending allowance resets each calendar day. "
-    "Cash and open holdings carry forward."
+    "Daily allowance resets using India time. Cash and holdings carry forward."
+)
+
+st.subheader("Active Risk Controls")
+
+r1, r2, r3 = st.columns(3)
+r1.metric("Stop-loss per position", f"{STOP_LOSS_PCT:.0f}%")
+r2.metric("Maximum allocation per stock", f"₹{MAX_STOCK_ALLOCATION:,.0f}")
+r3.metric(
+    "New BUY trades today",
+    f"{buys_today(trades)} / {MAX_NEW_BUYS_PER_DAY}"
 )
 
 
@@ -794,9 +835,7 @@ if st.button("Run Agent Scan Now", type="primary"):
         symbol = str(row["SYMBOL"]) + ".NS"
 
         try:
-            data = analyse_stock(
-                download_data(symbol, "1y", "1d")
-            )
+            data = analyse_stock(download_data(symbol, "1y", "1d"))
 
             if data.empty:
                 results.append({
@@ -804,26 +843,22 @@ if st.button("Run Agent Scan Now", type="primary"):
                     "Decision": "HOLD",
                     "Reason": "No historical data"
                 })
-
             else:
                 price = float(data["Close"].iloc[-1])
-
                 action, reason = agent_decision(
                     data,
                     symbol in holdings
                 )
 
-                cash, holdings, spent, trades, outcome = (
-                    execute_decision(
-                        symbol,
-                        action,
-                        price,
-                        reason,
-                        cash,
-                        holdings,
-                        spent,
-                        trades
-                    )
+                cash, holdings, spent, trades, outcome = execute_decision(
+                    symbol,
+                    action,
+                    price,
+                    reason,
+                    cash,
+                    holdings,
+                    spent,
+                    trades
                 )
 
                 results.append({
@@ -864,33 +899,31 @@ holding_rows = []
 for symbol, position in holdings.items():
     try:
         data = download_data(symbol, "5d", "1d")
-
         current = (
             float(data["Close"].dropna().iloc[-1])
             if not data.empty
             else float(position["entry_price"])
         )
-
     except Exception:
         current = float(position["entry_price"])
 
     qty = int(position["quantity"])
     entry = float(position["entry_price"])
+    unrealized = round((current - entry) * qty, 2)
+    stop_price = round(entry * (1 - STOP_LOSS_PCT / 100), 2)
 
     holding_rows.append({
         "Stock": symbol,
         "Quantity": qty,
         "Entry price": entry,
+        "Stop-loss reference": stop_price,
         "Latest available close": current,
-        "Unrealized P&L": round((current - entry) * qty, 2)
+        "Unrealized P&L": unrealized,
+        "Stop-loss reached": current <= stop_price
     })
 
-
 if holding_rows:
-    st.dataframe(
-        pd.DataFrame(holding_rows),
-        use_container_width=True
-    )
+    st.dataframe(pd.DataFrame(holding_rows), use_container_width=True)
 else:
     st.write("No open positions.")
 
@@ -902,69 +935,53 @@ st.subheader("Paper Trading History")
 
 if trades:
     history = pd.DataFrame(trades)
-
     st.dataframe(history, use_container_width=True)
 
     realized_pnl = sum(
-        float(trade["P&L"])
-        for trade in trades
-        if trade["Action"] == "SELL"
+        float(t["P&L"])
+        for t in trades
+        if t["Action"] == "SELL"
     )
-
-    st.metric(
-        "Cumulative realized P&L",
-        f"₹{realized_pnl:,.2f}"
-    )
+    st.metric("Cumulative realized P&L", f"₹{realized_pnl:,.2f}")
 
     history["Time"] = pd.to_datetime(
-        history["Time"],
-        errors="coerce",
-        utc=True
+        history["Time"], errors="coerce", utc=True
     )
-
-    sells = history[
-        history["Action"] == "SELL"
-    ].copy()
+    sells = history[history["Action"] == "SELL"].copy()
 
     if not sells.empty:
-        sells["Day"] = sells["Time"].dt.date
-
-        daily = sells.groupby(
-            "Day", as_index=False
-        )["P&L"].sum()
+        sells["Day"] = (
+            sells["Time"].dt.tz_convert(MARKET_TZ).dt.date
+        )
+        daily = sells.groupby("Day", as_index=False)["P&L"].sum()
 
         st.subheader("Daily Realized P&L")
         st.dataframe(daily, use_container_width=True)
 
-        sells["Week"] = sells["Time"].dt.strftime("%G-W%V")
-        sells["Month"] = sells["Time"].dt.strftime("%Y-%m")
+        sells["Week"] = (
+            sells["Time"].dt.tz_convert(MARKET_TZ).dt.strftime("%G-W%V")
+        )
+        sells["Month"] = (
+            sells["Time"].dt.tz_convert(MARKET_TZ).dt.strftime("%Y-%m")
+        )
 
-        weekly = sells.groupby(
-            "Week", as_index=False
-        )["P&L"].sum()
-
-        monthly = sells.groupby(
-            "Month", as_index=False
-        )["P&L"].sum()
+        weekly = sells.groupby("Week", as_index=False)["P&L"].sum()
+        monthly = sells.groupby("Month", as_index=False)["P&L"].sum()
 
         left, right = st.columns(2)
-
         left.subheader("Weekly P&L")
         left.dataframe(weekly, use_container_width=True)
-
         right.subheader("Monthly P&L")
         right.dataframe(monthly, use_container_width=True)
-
 else:
     st.write("No simulated trades recorded yet.")
 
 
 # ============================================================
-# BACKTEST DASHBOARD
+# HISTORICAL BACKTEST DASHBOARD
 # ============================================================
 st.divider()
 st.header("Historical Strategy Backtest")
-
 st.caption(
     "Historical simulation only. Results do not predict future performance."
 )
@@ -987,24 +1004,20 @@ if st.button("Run Historical Backtest"):
 
             results, error = backtest_strategy(
                 historical,
-                initial_cash=10000,
+                initial_cash=INITIAL_CASH,
                 fee_bps=10,
                 slippage_bps=10
             )
 
             if error:
                 st.warning(error)
-
             else:
                 st.subheader(f"Results — {selected_symbol}")
                 st.json(results["summary"])
 
                 st.write("Simulated trades")
-
                 if results["trades"].empty:
-                    st.info(
-                        "No trades were triggered during this period."
-                    )
+                    st.info("No trades were triggered during this period.")
                 else:
                     st.dataframe(
                         results["trades"],
@@ -1012,13 +1025,11 @@ if st.button("Run Historical Backtest"):
                     )
 
                 st.write("Portfolio equity over time")
-
                 st.line_chart(
                     results["equity"].set_index("Date")["Equity"]
                 )
 
                 st.write("Drawdown over time (%)")
-
                 st.line_chart(
                     results["equity"].set_index("Date")["DrawdownPct"]
                 )
@@ -1030,12 +1041,11 @@ if st.button("Run Historical Backtest"):
 
 
 # ============================================================
-# IMPORTANT LIMITATIONS
+# LIMITATIONS
 # ============================================================
 st.caption(
-    "This is a rule-based paper-trading prototype using daily historical "
-    "prices. It is not a live intraday system or a guaranteed predictor. "
-    "The scan runs only when you click the scan button. "
-    "Scheduled scans require a separate background worker. "
-    "No real orders are placed."
+    "Paper trading only. Stop-loss checks use available daily closing prices "
+    "and cannot guarantee a particular exit price. The agent scans only when "
+    "you click the scan button; scheduled scans require a separate worker. "
+    "This rule-based strategy is not a guarantee of profit."
 )
