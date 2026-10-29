@@ -623,3 +623,33 @@ if st.session_state.paper_trades:
     st.metric("Realized simulated P&L", f"₹{realized_pnl:,.2f}")
 else:
     st.write("No simulated trades yet.")
+
+
+# Supabase connection test
+import streamlit as st
+from supabase import create_client
+
+st.divider()
+st.subheader("Database Connection")
+
+if st.button("Test Supabase Connection"):
+    try:
+        supabase = create_client(
+            st.secrets["SUPABASE_URL"],
+            st.secrets["SUPABASE_SECRET_KEY"]
+        )
+
+        result = (
+            supabase.table("paper_trades")
+            .select("id")
+            .limit(1)
+            .execute()
+        )
+
+        st.success("Supabase connected successfully!")
+        st.write("Your paper_trades table is accessible.")
+
+    except Exception as e:
+        st.error("Connection test failed.")
+        st.caption(str(e))
+
