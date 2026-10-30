@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 
 # ============================================================
-# CONFIGURATION
+# 1. CONFIGURATION
 # ============================================================
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -26,8 +26,9 @@ MAX_STOCKS_PER_SCAN = 20
 
 GEMINI_MODEL = "gemini-3.8-flash"
 
+
 # ============================================================
-# TIME FUNCTIONS
+# 2. TIME FUNCTIONS
 # ============================================================
 
 def now_utc():
@@ -52,7 +53,7 @@ def trade_date_ist(value):
 
 
 # ============================================================
-# CONNECTIONS
+# 3. CONNECTIONS
 # ============================================================
 
 url = os.environ["SUPABASE_URL"].strip()
@@ -72,7 +73,7 @@ supabase = create_client(url, key)
 
 
 # ============================================================
-# TELEGRAM
+# 4. TELEGRAM
 # ============================================================
 
 def telegram(message):
@@ -91,64 +92,78 @@ def telegram(message):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError("Telegram API did not confirm delivery.")
+        raise RuntimeError("Telegram delivery was not confirmed.")
+
+
+def send_telegram_report(report):
+
+    # Keep messages below Telegram's message-length limit.
+    chunks = [
+        report[i:i + 3500]
+        for i in range(0, len(report), 3500)
+    ]
+
+    for chunk in chunks:
+        telegram(chunk)
 
 
 # ============================================================
-# GEMINI GENERATIVE AI ANALYSIS
+# 5. GEMINI GENERATIVE AI
 # ============================================================
 
 def gemini_market_analysis(stock_data, cash, holdings):
 
     if not gemini_api_key:
-        return "Gemini API key not configured. Rule-based scan remains active."
+        return "Gemini API key not configured."
 
     if not stock_data:
-        return "No valid stock data available for Gemini analysis."
+        return "No valid stock data available for AI analysis."
 
     prompt = f"""
 You are an AI-powered Indian stock market research analyst.
 
-Your task is to analyze the technical market data supplied
-by an automated paper-trading system.
+Analyze the following technical data from an NSE stock scanner.
 
 PORTFOLIO INFORMATION:
 
 Available cash: INR {cash:.2f}
-Number of open positions: {len(holdings)}
+Open positions: {len(holdings)}
 
-TECHNICAL STOCK DATA:
+STOCK DATA:
 
 {stock_data}
 
-ANALYSIS REQUIREMENTS:
+YOUR TASK:
 
-1. Identify the strongest bullish technical patterns.
-2. Identify bearish patterns and potential weaknesses.
-3. Explain the significance of SMA20 and SMA50.
-4. Interpret the RSI values.
-5. Identify conflicting indicators and potential risks.
-6. Compare stocks and identify those worth monitoring.
-7. Explain the existing Python BUY, SELL and HOLD signals.
-8. Provide a concise overall market summary.
+1. Summarize the overall market observations.
+2. Identify the strongest bullish technical patterns.
+3. Identify bearish patterns and potential weaknesses.
+4. Explain the SMA20 and SMA50 trends.
+5. Interpret the RSI values.
+6. Identify conflicting indicators and risks.
+7. Compare stocks worth monitoring.
+8. Explain the existing Python BUY, SELL and HOLD signals.
+9. Provide a concise conclusion for the next trading session.
 
-IMPORTANT RULES:
+IMPORTANT INSTRUCTIONS:
 
-- Use ONLY the supplied stock data.
-- Never invent market news, prices or financial results.
+- Use only the supplied data.
+- Do not invent news, prices or financial results.
 - Do not claim to have checked live news.
 - Do not guarantee future stock performance.
-- Clearly distinguish technical observations from predictions.
-- Do not execute trades or override Python risk controls.
-- If the data is insufficient, explicitly mention it.
+- Clearly distinguish observations from predictions.
+- Do not execute trades.
+- Never override Python risk controls.
+- Mention when the supplied data is insufficient.
 
-Write your response in simple, professional language.
-Keep the report concise and useful for a daily investor review.
+Write in simple, professional language.
+Keep the analysis concise and useful.
 """
 
     try:
 
         response = requests.post(
+
             f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
 
             headers={
@@ -181,7 +196,7 @@ Keep the report concise and useful for a daily investor review.
         candidates = data.get("candidates", [])
 
         if not candidates:
-            return "Gemini returned no analysis. Rule-based scan remains active."
+            return "Gemini returned no analysis."
 
         parts = candidates[0].get("content", {}).get("parts", [])
 
@@ -208,24 +223,24 @@ Keep the report concise and useful for a daily investor review.
 
         return (
             f"Gemini API unavailable (HTTP {status}). "
-            "Rule-based scan remains active."
+            "Rule-based analysis remains active."
         )
 
     except Exception as error:
 
-        print(f"Gemini analysis error: {type(error).__name__}")
+        print(f"Gemini error: {type(error).__name__}")
 
         return (
             "Gemini analysis unavailable. "
-            "Rule-based scan remains active."
+            "Rule-based analysis remains active."
         )
 
 
 # ============================================================
-# SUPABASE PORTFOLIO AND TRADE HISTORY
+# 6. SUPABASE PORTFOLIO
 # ============================================================
 
-def load_portfolio():
+def load_portfolio(reset_daily_budget=True):
 
     response = (
         supabase.table("paper_portfolio")
@@ -240,6 +255,12 @@ def load_portfolio():
         row = response.data[0]
 
     else:
+
+        if not reset_daily_budget:
+            raise RuntimeError(
+                "Portfolio does not exist. "
+                "Run the scheduled setup before manual testing."
+            )
 
         row = {
             "id": 1,
@@ -259,7 +280,7 @@ def load_portfolio():
 
     reset_date = str(row.get("last_budget_reset") or "")
 
-    if reset_date != today_ist():
+    if reset_daily_budget and reset_date != today_ist():
 
         spent = 0.0
 
@@ -286,6 +307,10 @@ def save_portfolio(cash, holdings, spent):
 
     }).execute()
 
+
+# ============================================================
+# 7. TRADE HISTORY
+# ============================================================
 
 def load_trades():
 
@@ -353,7 +378,7 @@ def buys_today(trades):
 
 
 # ============================================================
-# DAILY RUN GUARD
+# 8. DAILY RUN GUARD
 # ============================================================
 
 def claim_daily_run():
@@ -361,17 +386,11 @@ def claim_daily_run():
     run_date = today_ist()
 
     existing = (
-
         supabase.table("agent_runs")
-
         .select("*")
-
         .eq("run_date", run_date)
-
         .limit(1)
-
         .execute()
-
     )
 
     if existing.data:
@@ -433,7 +452,7 @@ def finish_daily_run(status, summary):
 
 
 # ============================================================
-# STOCK LIST
+# 9. STOCK LIST
 # ============================================================
 
 def load_stock_symbols():
@@ -450,24 +469,17 @@ def load_stock_symbols():
             raise ValueError("nse_stocks.csv is empty.")
 
         symbol_column = next(
-
             (
                 name for name in reader.fieldnames
-
                 if name.strip().upper() == "SYMBOL"
-
             ),
-
             None
-
         )
 
         if not symbol_column:
-
             raise ValueError("nse_stocks.csv needs a SYMBOL column.")
 
         symbols = []
-
         seen = set()
 
         for row in reader:
@@ -477,14 +489,13 @@ def load_stock_symbols():
             if symbol and symbol not in seen:
 
                 symbols.append(symbol)
-
                 seen.add(symbol)
 
     return symbols[:MAX_STOCKS_PER_SCAN]
 
 
 # ============================================================
-# STOCK DATA AND TECHNICAL INDICATORS
+# 10. STOCK DATA AND INDICATORS
 # ============================================================
 
 def download_stock(symbol):
@@ -543,7 +554,7 @@ def download_stock(symbol):
 
 
 # ============================================================
-# RULE-BASED TRADING DECISIONS
+# 11. RULE-BASED DECISIONS
 # ============================================================
 
 def decide(df, is_holding):
@@ -576,7 +587,7 @@ def decide(df, is_holding):
 
 
 # ============================================================
-# PAPER TRADE EXECUTION
+# 12. PAPER TRADE EXECUTION
 # ============================================================
 
 def execute(
@@ -690,15 +701,11 @@ def execute(
 
         save_trade(trade)
 
-        save_portfolio(
-            new_cash,
-            new_holdings,
-            new_spent
-        )
+        save_portfolio(new_cash, new_holdings, new_spent)
 
         trades.append(trade)
 
-        message = (
+        telegram(
 
             f"PAPER BUY: {symbol}\n"
 
@@ -713,8 +720,6 @@ def execute(
             "Simulation only; no real order."
 
         )
-
-        telegram(message)
 
         return (
             new_cash,
@@ -770,11 +775,7 @@ def execute(
 
         save_trade(trade)
 
-        save_portfolio(
-            new_cash,
-            new_holdings,
-            spent
-        )
+        save_portfolio(new_cash, new_holdings, spent)
 
         trades.append(trade)
 
@@ -808,20 +809,37 @@ def execute(
 
 
 # ============================================================
-# MAIN DAILY SCAN
+# 13. MAIN AGENT
 # ============================================================
 
 def main():
 
-    if datetime.now(IST).weekday() >= 5:
+    # GitHub automatically sets this variable.
+    manual_test = (
+        os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    )
 
-        print("Weekend in India; no scan performed.")
+    # Scheduled runs only operate on weekdays.
+    if not manual_test and datetime.now(IST).weekday() >= 5:
+
+        print("Weekend in India; no scheduled scan.")
 
         return
 
-    if not claim_daily_run():
+    # Only scheduled runs claim the daily record.
+    if not manual_test and not claim_daily_run():
 
         return
+
+    if manual_test:
+
+        print("MANUAL GENAI TEST MODE")
+        print("Paper trading is disabled.")
+        print("Daily run record will not be modified.")
+
+    else:
+
+        print("SCHEDULED PAPER-TRADING MODE")
 
     results = []
 
@@ -829,18 +847,20 @@ def main():
 
     stock_data = []
 
+    daily_claimed = not manual_test
+
     try:
 
-        # LOAD PORTFOLIO
-
-        cash, holdings, spent = load_portfolio()
+        # Manual mode loads portfolio without resetting or saving it.
+        cash, holdings, spent = load_portfolio(
+            reset_daily_budget=not manual_test
+        )
 
         trades = load_trades()
 
         symbols = load_stock_symbols()
 
-        # INCLUDE ALL OPEN HOLDINGS IN THE SCAN
-
+        # Include all current holdings for stop-loss monitoring.
         held_symbols = [
 
             symbol[:-3] if symbol.endswith(".NS") else symbol
@@ -851,7 +871,9 @@ def main():
 
         symbols = list(dict.fromkeys(symbols + held_symbols))
 
+        # ----------------------------------------------------
         # SCAN STOCKS
+        # ----------------------------------------------------
 
         for raw_symbol in symbols:
 
@@ -880,25 +902,33 @@ def main():
                     ticker in holdings
                 )
 
-                cash, holdings, spent, trades, outcome = execute(
+                # MANUAL MODE: ANALYSIS ONLY.
+                # NO SIMULATED BUY OR SELL.
+                if manual_test:
 
-                    ticker,
+                    outcome = "Analysis-only. No paper trade executed."
 
-                    action,
+                else:
 
-                    price,
+                    cash, holdings, spent, trades, outcome = execute(
 
-                    reason,
+                        ticker,
 
-                    cash,
+                        action,
 
-                    holdings,
+                        price,
 
-                    spent,
+                        reason,
 
-                    trades
+                        cash,
 
-                )
+                        holdings,
+
+                        spent,
+
+                        trades
+
+                    )
 
                 results.append(
 
@@ -907,8 +937,7 @@ def main():
 
                 )
 
-                # COLLECT TECHNICAL DATA FOR GEMINI
-
+                # Collect actual indicators for Gemini.
                 latest = df.iloc[-1]
 
                 stock_data.append(
@@ -923,7 +952,7 @@ def main():
 
                     f"RSI: {float(latest['RSI']):.2f} | "
 
-                    f"Rule signal: {action} | "
+                    f"Python signal: {action} | "
 
                     f"Reason: {reason}"
 
@@ -945,11 +974,14 @@ def main():
 
                 )
 
-        # SAVE PORTFOLIO
+        # Only scheduled mode saves portfolio changes.
+        if not manual_test:
 
-        save_portfolio(cash, holdings, spent)
+            save_portfolio(cash, holdings, spent)
 
-        # GENERATE GENAI ANALYSIS
+        # ----------------------------------------------------
+        # GEMINI ANALYSIS
+        # ----------------------------------------------------
 
         print("Generating Gemini AI market analysis...")
 
@@ -965,7 +997,9 @@ def main():
 
         print("Gemini analysis completed.")
 
-        # CALCULATE REALIZED P&L
+        # ----------------------------------------------------
+        # REPORT
+        # ----------------------------------------------------
 
         realized_pnl = sum(
 
@@ -977,11 +1011,13 @@ def main():
 
         )
 
-        # BUILD DAILY REPORT
-
         report = [
 
-            f"📊 DAILY PAPER-TRADING REPORT — {today_ist()}",
+            "📊 STOCK MARKET AI AGENT",
+
+            f"Date: {today_ist()}",
+
+            f"Mode: {'MANUAL GENAI TEST' if manual_test else 'SCHEDULED PAPER TRADING'}",
 
             "",
 
@@ -1004,7 +1040,7 @@ def main():
 
             "",
 
-            "📈 RULE-BASED SCAN RESULTS:",
+            "📈 PYTHON TECHNICAL SCAN:",
 
             *results,
 
@@ -1016,43 +1052,47 @@ def main():
 
         ]
 
+        if manual_test:
+
+            report.extend([
+
+                "",
+
+                "ℹ️ MANUAL TEST: No paper trades were executed.",
+
+                "Portfolio and daily-run record were not modified."
+
+            ])
+
         if errors:
 
             report.extend([
 
                 "",
 
-                "ERRORS:",
+                "⚠️ SCAN ERRORS:",
 
                 *errors[:10]
 
             ])
 
-        # SPLIT TELEGRAM MESSAGES
-
         full_report = "\n".join(report)
 
-        chunks = [
+        # Send report to Telegram.
+        send_telegram_report(full_report)
 
-            full_report[i:i + 3500]
+        # Only scheduled mode completes the daily record.
+        if not manual_test:
 
-            for i in range(0, len(full_report), 3500)
+            finish_daily_run(
+                "completed",
+                full_report
+            )
 
-        ]
+        else:
 
-        for chunk in chunks:
-
-            telegram(chunk)
-
-        # MARK DAILY RUN COMPLETE
-
-        finish_daily_run(
-
-            "completed",
-
-            full_report
-
-        )
+            print("Manual GenAI test completed.")
+            print("Daily run record unchanged.")
 
         print(full_report)
 
@@ -1067,7 +1107,9 @@ def main():
 
         try:
 
-            finish_daily_run("failed", failure)
+            if daily_claimed:
+
+                finish_daily_run("failed", failure)
 
             telegram(failure)
 
@@ -1079,7 +1121,7 @@ def main():
 
 
 # ============================================================
-# ENTRY POINT
+# 14. ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
