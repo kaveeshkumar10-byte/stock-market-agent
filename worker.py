@@ -3,7 +3,7 @@ import os
 import json
 import time
 import re
-from datetime import datetime, date, time as dt_time, timedelta
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -14,7 +14,7 @@ from supabase import create_client
 
 
 # ============================================================
-# CONFIGURATION
+# 1. CONFIGURATION
 # ============================================================
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -29,7 +29,7 @@ DAILY_BUDGET = 10000.0
 MAX_PER_STOCK = 2500.0
 MAX_NEW_BUYS_PER_DAY = 2
 STOP_LOSS_PERCENT = 0.05
-MIN_AI_CONFIDENCE = 70
+MIN_BUY_SCORE = 70
 
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
@@ -53,13 +53,15 @@ required = {
 
 missing = [key for key, value in required.items() if not value]
 if missing:
-    raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+    raise RuntimeError(
+        "Missing required environment variables: " + ", ".join(missing)
+    )
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================================
-# TIME AND NOTIFICATION HELPERS
+# 2. TIME AND TELEGRAM
 # ============================================================
 
 def now_ist():
@@ -68,10 +70,6 @@ def now_ist():
 
 def today_ist():
     return now_ist().date()
-
-
-def is_weekday():
-    return today_ist().weekday() < 5
 
 
 def is_market_hours():
@@ -89,17 +87,16 @@ def send_telegram(message):
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-    # Keep messages below Telegram's message-size limit.
-    chunks = [message[i:i + 3500] for i in range(0, len(message), 3500)]
+    chunks = [
+        message[i:i + 3500]
+        for i in range(0, len(message), 3500)
+    ]
 
     for chunk in chunks:
         try:
             requests.post(
                 url,
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": chunk,
-                },
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
                 timeout=15,
             ).raise_for_status()
         except Exception as exc:
@@ -107,7 +104,7 @@ def send_telegram(message):
 
 
 # ============================================================
-# PORTFOLIO
+# 3. PORTFOLIO MANAGEMENT
 # ============================================================
 
 def empty_portfolio():
@@ -137,15 +134,14 @@ def normalise_holdings(raw_holdings):
         if not isinstance(item, dict):
             continue
 
-        quantity = item.get("quantity", item.get("qty", 0))
-        average_price = item.get(
-            "average_price",
-            item.get("avg_price", item.get("buy_price", 0)),
-        )
-
         try:
-            quantity = int(quantity)
-            average_price = float(average_price)
+            quantity = int(item.get("quantity", item.get("qty", 0)))
+            average_price = float(
+                item.get(
+                    "average_price",
+                    item.get("avg_price", item.get("buy_price", 0)),
+                )
+            )
         except (TypeError, ValueError):
             continue
 
@@ -170,22 +166,27 @@ def load_portfolio(reset_daily_budget=False):
     if not response.data:
         portfolio = empty_portfolio()
 
-        # A manual analysis must not create or modify portfolio records.
         if reset_daily_budget:
             supabase.table("paper_portfolio").upsert(portfolio).execute()
 
         return portfolio
 
     portfolio = response.data[0]
-    portfolio["holdings"] = normalise_holdings(portfolio.get("holdings"))
+    portfolio["holdings"] = normalise_holdings(
+        portfolio.get("holdings")
+    )
 
-    try:
-        portfolio["cash_balance"] = float(portfolio.get("cash_balance", 0))
-        portfolio["daily_spent"] = float(portfolio.get("daily_spent", 0))
-    except (TypeError, ValueError):
-        raise RuntimeError("Invalid cash_balance or daily_spent in paper_portfolio.")
+    portfolio["cash_balance"] = float(
+        portfolio.get("cash_balance", 0)
+    )
+    portfolio["daily_spent"] = float(
+        portfolio.get("daily_spent", 0)
+    )
 
-    if reset_daily_budget and portfolio.get("last_budget_reset") != str(today_ist()):
+    if (
+        reset_daily_budget
+        and portfolio.get("last_budget_reset") != str(today_ist())
+    ):
         portfolio["daily_spent"] = 0.0
         portfolio["last_budget_reset"] = str(today_ist())
         save_portfolio(portfolio)
@@ -198,7 +199,9 @@ def save_portfolio(portfolio):
         "id": 1,
         "cash_balance": round(float(portfolio["cash_balance"]), 2),
         "holdings": portfolio["holdings"],
-        "last_budget_reset": portfolio.get("last_budget_reset", str(today_ist())),
+        "last_budget_reset": portfolio.get(
+            "last_budget_reset", str(today_ist())
+        ),
         "daily_spent": round(float(portfolio.get("daily_spent", 0)), 2),
         "updated_at": now_ist().isoformat(),
     }
@@ -207,21 +210,29 @@ def save_portfolio(portfolio):
 
 
 # ============================================================
-# STOCK UNIVERSE
+# 4. NSE STOCK LIST
 # ============================================================
 
 def load_stock_universe(portfolio):
     if not os.path.exists("nse_stocks.csv"):
-        raise FileNotFoundError("nse_stocks.csv was not found in the repository.")
+        raise FileNotFoundError(
+            "nse_stocks.csv was not found in the repository."
+        )
 
     stocks_df = pd.read_csv("nse_stocks.csv")
 
     if stocks_df.empty:
         raise RuntimeError("nse_stocks.csv is empty.")
 
-    possible_columns = ["symbol", "Symbol", "SYMBOL", "ticker", "Ticker"]
+    possible_columns = [
+        "symbol", "Symbol", "SYMBOL", "ticker", "Ticker"
+    ]
+
     symbol_column = next(
-        (column for column in possible_columns if column in stocks_df.columns),
+        (
+            column for column in possible_columns
+            if column in stocks_df.columns
+        ),
         stocks_df.columns[0],
     )
 
@@ -239,19 +250,16 @@ def load_stock_universe(portfolio):
         if symbol not in symbols:
             symbols.append(symbol)
 
-    # Keep existing holdings in the scan, even if they are not in the CSV.
+    # Ensure existing holdings are included in the scan.
     for symbol in portfolio["holdings"]:
         if symbol not in symbols:
             symbols.append(symbol)
 
-    return symbols[:MAX_STOCKS] + [
-        symbol for symbol in portfolio["holdings"]
-        if symbol not in symbols[:MAX_STOCKS]
-    ]
+    return symbols
 
 
 # ============================================================
-# MARKET DATA
+# 5. TECHNICAL INDICATORS AND MARKET DATA
 # ============================================================
 
 def calculate_rsi(series, period=14):
@@ -271,13 +279,15 @@ def calculate_rsi(series, period=14):
         adjust=False,
     ).mean()
 
-    relative_strength = average_gain / average_loss.replace(0, float("nan"))
+    relative_strength = (
+        average_gain / average_loss.replace(0, float("nan"))
+    )
+
     return 100 - (100 / (1 + relative_strength))
 
 
 def clean_yfinance_columns(df):
     if isinstance(df.columns, pd.MultiIndex):
-        # For a single ticker, remove the ticker level.
         df.columns = [
             column[0] if isinstance(column, tuple) else column
             for column in df.columns
@@ -305,6 +315,7 @@ def download_intraday(symbol, manual_mode):
         df = clean_yfinance_columns(df)
 
         required_columns = ["Close", "High", "Low", "Volume"]
+
         if not all(column in df.columns for column in required_columns):
             return None, f"{symbol}: Required price columns are missing."
 
@@ -322,13 +333,19 @@ def download_intraday(symbol, manual_mode):
 
         df.index = index.tz_convert(IST)
 
-        # Calculate indicators using the full downloaded history first.
-        df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
-        df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
+        # Calculate trend indicators over downloaded history.
+        df["EMA9"] = df["Close"].ewm(
+            span=9, adjust=False
+        ).mean()
+
+        df["EMA21"] = df["Close"].ewm(
+            span=21, adjust=False
+        ).mean()
+
         df["RSI"] = calculate_rsi(df["Close"])
 
-        # Manual runs can use the latest available session, including
-        # after market hours, weekends and market holidays.
+        # Manual mode uses the latest available trading session.
+        # Scheduled mode uses today's session only.
         if manual_mode:
             session_date = df.index[-1].date()
         else:
@@ -337,7 +354,9 @@ def download_intraday(symbol, manual_mode):
         session_df = df[df.index.date == session_date].copy()
 
         if session_df.empty:
-            return None, f"{symbol}: No candles available for {session_date}."
+            return None, (
+                f"{symbol}: No candles available for {session_date}."
+            )
 
         if len(session_df) < 10:
             return None, (
@@ -345,36 +364,44 @@ def download_intraday(symbol, manual_mode):
                 f"for {session_date}; at least 10 are required."
             )
 
-        # VWAP is calculated only for the selected trading session.
+        # VWAP calculated within the selected session only.
         typical_price = (
-            session_df["High"] + session_df["Low"] + session_df["Close"]
+            session_df["High"]
+            + session_df["Low"]
+            + session_df["Close"]
         ) / 3
 
         volume = session_df["Volume"].fillna(0)
         cumulative_volume = volume.cumsum().replace(0, float("nan"))
+
         session_df["VWAP"] = (
             (typical_price * volume).cumsum() / cumulative_volume
         )
 
         latest = session_df.iloc[-1]
         candle_time = session_df.index[-1]
-        age_minutes = (now_ist() - candle_time).total_seconds() / 60
+
+        age_minutes = (
+            now_ist() - candle_time
+        ).total_seconds() / 60
 
         if not manual_mode and age_minutes > MAX_DATA_AGE_MINUTES:
             return None, (
-                f"{symbol}: Latest candle is {age_minutes:.0f} minutes old; "
-                f"maximum allowed is {MAX_DATA_AGE_MINUTES} minutes."
+                f"{symbol}: Latest candle is {age_minutes:.0f} minutes old."
             )
 
-        values = {
+        if pd.isna(latest["RSI"]) or pd.isna(latest["VWAP"]):
+            return None, (
+                f"{symbol}: RSI or VWAP could not be calculated."
+            )
+
+        result = {
             "symbol": symbol,
             "price": round(float(latest["Close"]), 2),
             "ema9": round(float(latest["EMA9"]), 2),
             "ema21": round(float(latest["EMA21"]), 2),
-            "rsi": round(float(latest["RSI"]), 2)
-                if pd.notna(latest["RSI"]) else None,
-            "vwap": round(float(latest["VWAP"]), 2)
-                if pd.notna(latest["VWAP"]) else None,
+            "rsi": round(float(latest["RSI"]), 2),
+            "vwap": round(float(latest["VWAP"]), 2),
             "volume": int(latest["Volume"])
                 if pd.notna(latest["Volume"]) else 0,
             "candle_time": candle_time.isoformat(),
@@ -382,13 +409,12 @@ def download_intraday(symbol, manual_mode):
             "data_age_minutes": round(age_minutes, 1),
         }
 
-        if values["rsi"] is None or values["vwap"] is None:
-            return None, f"{symbol}: RSI or VWAP could not be calculated."
-
-        return values, None
+        return result, None
 
     except Exception as exc:
-        return None, f"{symbol}: Data download error: {str(exc)[:180]}"
+        return None, (
+            f"{symbol}: Data download error: {str(exc)[:180]}"
+        )
 
 
 def collect_market_data(symbols, manual_mode):
@@ -397,30 +423,36 @@ def collect_market_data(symbols, manual_mode):
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
-            executor.submit(download_intraday, symbol, manual_mode): symbol
+            executor.submit(
+                download_intraday, symbol, manual_mode
+            ): symbol
             for symbol in symbols
         }
 
         for future in as_completed(futures):
-            result, error = future.result()
+            try:
+                result, error = future.result()
 
-            if result:
-                market_data[result["symbol"]] = result
+                if result:
+                    market_data[result["symbol"]] = result
 
-            if error:
-                errors.append(error)
+                if error:
+                    errors.append(error)
+
+            except Exception as exc:
+                symbol = futures[future]
+                errors.append(f"{symbol}: {str(exc)[:180]}")
 
     return market_data, errors
 
 
 # ============================================================
-# GEMINI DECISION ENGINE
+# 6. GEMINI JSON RESPONSE HELPER
 # ============================================================
 
 def extract_json(text):
     text = text.strip()
 
-    # Remove optional Markdown code fences.
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
 
@@ -433,16 +465,21 @@ def extract_json(text):
     return json.loads(text[start:end + 1])
 
 
+# ============================================================
+# 7. GEMINI RANKED DECISION ENGINE
+# ============================================================
+
 def gemini_decisions(market_data, portfolio, manual_mode):
     session_dates = sorted({
-        item["session_date"] for item in market_data.values()
+        item["session_date"]
+        for item in market_data.values()
     })
 
     mode_description = (
-        "HISTORICAL/AFTER-HOURS ANALYSIS ONLY. Do not describe these prices "
-        "as live prices. No trades will be executed."
+        "HISTORICAL ANALYSIS ONLY. These are not live prices. "
+        "No trades will be executed."
         if manual_mode
-        else "INTRADAY ANALYSIS using the latest available market candles."
+        else "INTRADAY ANALYSIS using the latest available candles."
     )
 
     holdings_summary = {
@@ -454,46 +491,86 @@ def gemini_decisions(market_data, portfolio, manual_mode):
     }
 
     prompt = f"""
-You are the market-analysis decision engine for an NSE paper-trading system.
+You are the AI decision engine for an NSE intraday PAPER-TRADING system.
 
 MODE: {mode_description}
 DATA SESSION DATE(S): {session_dates}
 
-Analyse the supplied data and return a decision for each stock.
+Analyse every supplied stock and rank opportunities by signal quality.
 
-You may choose only BUY, SELL or HOLD.
+EVALUATE THESE INDICATORS:
 
-Consider:
-- EMA9 versus EMA21 trend.
-- RSI momentum.
-- Price relative to VWAP.
-- Whether the stock is already held.
-- Whether the decision is supported by the supplied data.
+1. EMA9 versus EMA21:
+   Understand short-term trend direction.
 
-Rules:
-- Do not invent news, events, prices or indicators.
-- Do not recommend BUY for a stock already held.
-- Do not recommend SELL for a stock that is not held.
-- Prefer HOLD when signals conflict or evidence is weak.
-- Confidence must be an integer from 0 to 100.
-- Give a short, data-based reason.
-- Do not claim certainty or guaranteed returns.
+2. RSI:
+   Understand momentum and overbought/oversold conditions.
 
-Portfolio holdings:
+3. Price versus VWAP:
+   Evaluate intraday price strength.
+
+4. Volume:
+   Evaluate participation and reliability of the signal.
+
+5. Existing holdings:
+   Consider SELL decisions only for stocks already held.
+
+SIGNAL SCORE: 0 TO 100
+
+Use this scoring framework:
+- Trend alignment: 0 to 25 points.
+- RSI momentum: 0 to 20 points.
+- VWAP confirmation: 0 to 20 points.
+- Volume confirmation: 0 to 20 points.
+- Overall signal consistency: 0 to 15 points.
+
+BUY CANDIDATE:
+- EMA9 should be above EMA21.
+- Price should be above VWAP.
+- RSI should preferably be between 50 and 70.
+- Volume should support the move.
+- Do not recommend BUY based on one indicator alone.
+
+SELL CANDIDATE:
+- Stock must already be held.
+- EMA9 below EMA21 or clear weakening momentum.
+- Price below VWAP provides additional confirmation.
+- Explain the exit reason.
+
+HOLD:
+- Indicators conflict.
+- Volume is zero or unreliable.
+- RSI is extremely overbought or oversold without confirmation.
+- Signal is weak or unclear.
+
+IMPORTANT RULES:
+- Signal score is NOT probability of profit.
+- Never invent prices, indicators, news or events.
+- Never recommend BUY for an existing holding.
+- Never recommend SELL for a stock not held.
+- Do not force a BUY or SELL.
+- HOLD is a valid decision.
+- Rank every stock from strongest to weakest.
+- Give a concise explanation using actual supplied indicators.
+- Return one decision for every supplied stock.
+
+CURRENT PORTFOLIO:
 {json.dumps(holdings_summary)}
 
-Market data:
+MARKET DATA:
 {json.dumps(list(market_data.values()))}
 
-Return JSON only in this exact structure:
+Return valid JSON only, in this structure:
+
 {{
-  "market_view": "Short overall market observation",
-  "decisions": [
+  "market_view": "Overall market observation",
+  "ranked_stocks": [
     {{
+      "rank": 1,
       "symbol": "RELIANCE.NS",
       "action": "BUY",
-      "confidence": 75,
-      "reason": "Short explanation based on supplied indicators"
+      "signal_score": 82,
+      "reason": "Explanation using actual supplied indicators"
     }}
   ]
 }}
@@ -507,7 +584,7 @@ Return JSON only in this exact structure:
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 2500,
+            "maxOutputTokens": 3000,
             "responseMimeType": "application/json",
             "thinkingConfig": {
                 "thinkingLevel": "minimal"
@@ -533,83 +610,128 @@ Return JSON only in this exact structure:
 
             if response.status_code >= 400:
                 raise RuntimeError(
-                    f"Gemini API returned HTTP {response.status_code}: "
+                    f"Gemini HTTP {response.status_code}: "
                     f"{response.text[:500]}"
                 )
 
             result = response.json()
-            text = result["candidates"][0]["content"]["parts"][0]["text"]
-            return extract_json(text)
+
+            response_text = (
+                result["candidates"][0]["content"]["parts"][0]["text"]
+            )
+
+            return extract_json(response_text)
 
         except Exception as exc:
             last_error = exc
             print(f"Gemini attempt {attempt + 1} failed: {exc}")
+
             if attempt == 0:
                 time.sleep(3)
 
-    raise RuntimeError(f"Gemini request failed after retries: {last_error}")
+    raise RuntimeError(f"Gemini request failed: {last_error}")
 
+
+# ============================================================
+# 8. DECISION VALIDATION AND RANKING
+# ============================================================
 
 def validate_decisions(ai_result, market_data, portfolio):
     validated = {}
-    raw_decisions = ai_result.get("decisions", [])
+
+    raw_decisions = ai_result.get("ranked_stocks", [])
 
     if not isinstance(raw_decisions, list):
         raw_decisions = []
 
-    for decision in raw_decisions:
-        if not isinstance(decision, dict):
+    for item in raw_decisions:
+        if not isinstance(item, dict):
             continue
 
-        symbol = str(decision.get("symbol", "")).upper().strip()
-        action = str(decision.get("action", "HOLD")).upper().strip()
+        symbol = str(item.get("symbol", "")).upper().strip()
 
-        if symbol not in market_data:
+        if symbol not in market_data or symbol in validated:
             continue
+
+        action = str(
+            item.get("action", "HOLD")
+        ).upper().strip()
 
         if action not in {"BUY", "SELL", "HOLD"}:
             action = "HOLD"
 
         try:
-            confidence = int(decision.get("confidence", 0))
-        except (TypeError, ValueError):
-            confidence = 0
+            score = int(item.get("signal_score", 0))
+        except (ValueError, TypeError):
+            score = 0
 
-        confidence = max(0, min(100, confidence))
+        score = max(0, min(100, score))
 
-        if confidence < MIN_AI_CONFIDENCE:
-            action = "HOLD"
+        data = market_data[symbol]
 
-        if action == "BUY" and symbol in portfolio["holdings"]:
-            action = "HOLD"
+        # Independent Python BUY validation.
+        if action == "BUY":
+            if (
+                score < MIN_BUY_SCORE
+                or symbol in portfolio["holdings"]
+                or data["ema9"] <= data["ema21"]
+                or data["price"] <= data["vwap"]
+                or data["volume"] <= 0
+                or data["rsi"] < 50
+                or data["rsi"] > 70
+            ):
+                action = "HOLD"
 
+        # SELL is only allowed for an existing holding.
         if action == "SELL" and symbol not in portfolio["holdings"]:
             action = "HOLD"
 
+        try:
+            rank = int(item.get("rank", 999))
+        except (ValueError, TypeError):
+            rank = 999
+
         validated[symbol] = {
             "action": action,
-            "confidence": confidence,
-            "reason": str(decision.get("reason", "No reason supplied"))[:300],
+            "confidence": score,
+            "reason": str(
+                item.get("reason", "No explanation provided.")
+            )[:300],
+            "rank": rank,
         }
 
-    # Missing AI decisions default to HOLD.
+    # Missing decisions become HOLD.
     for symbol in market_data:
         if symbol not in validated:
             validated[symbol] = {
                 "action": "HOLD",
                 "confidence": 0,
-                "reason": "Gemini did not return a decision for this stock.",
+                "reason": "No valid AI decision received.",
+                "rank": 999,
             }
+
+    # Sort by rank first, then score.
+    validated = dict(
+        sorted(
+            validated.items(),
+            key=lambda item: (
+                item[1]["rank"],
+                -item[1]["confidence"],
+            ),
+        )
+    )
 
     return validated
 
 
 # ============================================================
-# TRADE HISTORY AND PAPER EXECUTION
+# 9. TRADE HISTORY
 # ============================================================
 
 def get_todays_trades():
-    start = datetime.combine(today_ist(), dt_time.min).replace(tzinfo=IST)
+    start = datetime.combine(
+        today_ist(), dt_time.min
+    ).replace(tzinfo=IST)
 
     response = (
         supabase.table("paper_trades")
@@ -622,15 +744,13 @@ def get_todays_trades():
 
 
 def record_trade(symbol, action, quantity, price, pnl, reason):
-    trade_value = round(quantity * price, 2)
-
     record = {
         "trade_time": now_ist().isoformat(),
         "symbol": symbol,
         "action": action,
         "quantity": int(quantity),
         "price": round(float(price), 2),
-        "trade_value": trade_value,
+        "trade_value": round(quantity * price, 2),
         "pnl": round(float(pnl), 2),
         "reason": reason[:500],
     }
@@ -638,6 +758,10 @@ def record_trade(symbol, action, quantity, price, pnl, reason):
     supabase.table("paper_trades").insert(record).execute()
     return record
 
+
+# ============================================================
+# 10. PAPER SELL
+# ============================================================
 
 def execute_sell(portfolio, symbol, price, reason):
     holding = portfolio["holdings"].get(symbol)
@@ -676,6 +800,10 @@ def execute_sell(portfolio, symbol, price, reason):
     return True
 
 
+# ============================================================
+# 11. PAPER BUY
+# ============================================================
+
 def execute_buy(portfolio, symbol, price, reason, confidence):
     if symbol in portfolio["holdings"]:
         return False, "Already holding this stock."
@@ -687,18 +815,20 @@ def execute_buy(portfolio, symbol, price, reason, confidence):
         return False, "Invalid price."
 
     todays_trades = get_todays_trades()
+
     todays_buys = sum(
         1 for trade in todays_trades
         if str(trade.get("action", "")).upper() == "BUY"
     )
 
     if todays_buys >= MAX_NEW_BUYS_PER_DAY:
-        return False, "Daily maximum of 2 new BUY trades reached."
+        return False, "Daily maximum of 2 BUY trades reached."
 
-    remaining_daily_budget = DAILY_BUDGET - portfolio["daily_spent"]
+    remaining_budget = DAILY_BUDGET - portfolio["daily_spent"]
+
     allocation = min(
         MAX_PER_STOCK,
-        remaining_daily_budget,
+        remaining_budget,
         portfolio["cash_balance"],
     )
 
@@ -708,12 +838,13 @@ def execute_buy(portfolio, symbol, price, reason, confidence):
     quantity = int(allocation // price)
 
     if quantity <= 0:
-        return False, "Allocation is insufficient to buy one share."
+        return False, "Allocation is insufficient for one share."
 
     trade_value = quantity * price
 
     portfolio["cash_balance"] -= trade_value
     portfolio["daily_spent"] += trade_value
+
     portfolio["holdings"][symbol] = {
         "quantity": quantity,
         "average_price": round(price, 2),
@@ -725,7 +856,7 @@ def execute_buy(portfolio, symbol, price, reason, confidence):
         quantity=quantity,
         price=price,
         pnl=0,
-        reason=f"{reason} | Gemini confidence: {confidence}",
+        reason=f"{reason} | Signal score: {confidence}",
     )
 
     save_portfolio(portfolio)
@@ -735,7 +866,7 @@ def execute_buy(portfolio, symbol, price, reason, confidence):
         f"Quantity: {quantity}\n"
         f"Simulated price: ₹{price:.2f}\n"
         f"Trade value: ₹{trade_value:.2f}\n"
-        f"Gemini confidence: {confidence}%\n"
+        f"Signal score: {confidence}/100\n"
         f"Reason: {reason}"
     )
 
@@ -743,14 +874,10 @@ def execute_buy(portfolio, symbol, price, reason, confidence):
 
 
 # ============================================================
-# INDEPENDENT RISK CHECKS
+# 12. INDEPENDENT RISK CHECKS
 # ============================================================
 
 def run_independent_exit_checks(portfolio, market_data):
-    """
-    These checks do not depend on Gemini.
-    They run only in scheduled mode and only when fresh data exists.
-    """
     exited_symbols = set()
     messages = []
 
@@ -762,7 +889,7 @@ def run_independent_exit_checks(portfolio, market_data):
 
         if not market:
             messages.append(
-                f"{symbol}: Exit check not possible because fresh data is unavailable."
+                f"{symbol}: Exit check unavailable; no fresh market data."
             )
             continue
 
@@ -777,26 +904,31 @@ def run_independent_exit_checks(portfolio, market_data):
 
         if price <= stop_price:
             reason = (
-                f"Python risk control: 5% stop-loss threshold reached. "
-                f"Entry ₹{average_price:.2f}; latest price ₹{price:.2f}."
+                "Python risk control: 5% stop-loss threshold reached. "
+                f"Entry ₹{average_price:.2f}; "
+                f"latest price ₹{price:.2f}."
             )
 
             if execute_sell(portfolio, symbol, price, reason):
                 exited_symbols.add(symbol)
-                messages.append(f"{symbol}: Sold by independent stop-loss rule.")
+                messages.append(
+                    f"{symbol}: Sold by independent stop-loss rule."
+                )
 
         elif square_off_due:
             reason = "Python risk control: End-of-day square-off."
 
             if execute_sell(portfolio, symbol, price, reason):
                 exited_symbols.add(symbol)
-                messages.append(f"{symbol}: Sold by end-of-day square-off rule.")
+                messages.append(
+                    f"{symbol}: Sold by end-of-day square-off."
+                )
 
     return exited_symbols, messages
 
 
 # ============================================================
-# REPORTING
+# 13. TELEGRAM REPORT
 # ============================================================
 
 def build_report(
@@ -814,7 +946,7 @@ def build_report(
     )
 
     report = [
-        f"📊 INTRADAY GENAI AGENT",
+        "📊 INTRADAY GENAI AGENT",
         f"Mode: {mode}",
         f"Time: {now_ist().strftime('%d-%b-%Y %I:%M %p IST')}",
         f"Stocks analysed: {len(market_data)}",
@@ -822,32 +954,39 @@ def build_report(
 
     if market_data:
         sessions = sorted({
-            item["session_date"] for item in market_data.values()
+            item["session_date"]
+            for item in market_data.values()
         })
+
         report.append(f"Data session: {', '.join(sessions)}")
 
         if manual_mode:
-            report.append("Note: Manual analysis may use historical candles.")
+            report.append(
+                "Note: Manual analysis may use historical candles."
+            )
 
     if ai_result:
-        report.append("")
-        report.append("Market view:")
-        report.append(str(ai_result.get("market_view", "Not provided"))[:500])
+        report.extend([
+            "",
+            "Market view:",
+            str(ai_result.get("market_view", "Not provided"))[:500],
+        ])
 
     if decisions:
         report.append("")
-        report.append("AI decisions:")
+        report.append("RANKED AI DECISIONS:")
 
         for symbol, decision in decisions.items():
             report.append(
-                f"{symbol}: {decision['action']} | "
-                f"Confidence: {decision['confidence']}% | "
+                f"#{decision['rank']} {symbol}: "
+                f"{decision['action']} | "
+                f"Signal score: {decision['confidence']}/100 | "
                 f"{decision['reason']}"
             )
 
     if risk_messages:
         report.append("")
-        report.append("Independent risk checks:")
+        report.append("RISK CHECKS / EXECUTION:")
         report.extend(risk_messages)
 
     if errors:
@@ -856,17 +995,21 @@ def build_report(
         report.extend(errors[:15])
 
         if len(errors) > 15:
-            report.append(f"...and {len(errors) - 15} more data issues.")
+            report.append(
+                f"...and {len(errors) - 15} more data issues."
+            )
 
     return "\n".join(report)
 
 
 # ============================================================
-# MAIN
+# 14. MAIN AGENT
 # ============================================================
 
 def main():
-    manual_mode = os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    manual_mode = (
+        os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    )
 
     print("=" * 60)
     print("INTRADAY GENAI PAPER-TRADING AGENT")
@@ -874,21 +1017,25 @@ def main():
     print("Manual mode:", manual_mode)
     print("=" * 60)
 
-    # Scheduled runs are restricted to Indian market hours.
+    # Scheduled runs must be within configured market hours.
     if not manual_mode and not is_market_hours():
         message = (
             "⏸️ Scheduled agent skipped.\n"
             f"Current time: {now_ist().strftime('%d-%b-%Y %I:%M %p IST')}\n"
             "Outside configured NSE market hours."
         )
+
         print(message)
         send_telegram(message)
         return
 
-    # Manual runs read the portfolio but do not reset or save it.
-    portfolio = load_portfolio(reset_daily_budget=not manual_mode)
+    # Manual mode does not reset or modify the portfolio.
+    portfolio = load_portfolio(
+        reset_daily_budget=not manual_mode
+    )
 
     symbols = load_stock_universe(portfolio)
+
     print(f"Scanning {len(symbols)} stocks...")
 
     market_data, errors = collect_market_data(
@@ -902,15 +1049,20 @@ def main():
             market_data=market_data,
             errors=errors,
         )
+
         report += (
             "\n\nNo valid market data was available. "
             "No AI decisions or paper trades were made."
         )
+
         print(report)
         send_telegram(report)
         return
 
-    # Manual analysis is strictly read-only.
+    # --------------------------------------------------------
+    # MANUAL MODE: ANALYSIS ONLY
+    # --------------------------------------------------------
+
     if manual_mode:
         try:
             ai_result = gemini_decisions(
@@ -934,8 +1086,8 @@ def main():
             )
 
             report += (
-                "\n\n🔒 Manual mode: No trades were executed and "
-                "the portfolio was not modified."
+                "\n\n🔒 Manual mode: No trades were executed "
+                "and the portfolio was not modified."
             )
 
             print(report)
@@ -947,8 +1099,12 @@ def main():
                 market_data=market_data,
                 errors=errors,
             )
-            report += f"\n\n⚠️ Gemini analysis failed: {str(exc)[:500]}"
-            report += "\nNo trades were executed and the portfolio was not modified."
+
+            report += (
+                f"\n\n⚠️ Gemini analysis failed: {str(exc)[:500]}"
+                "\nNo trades were executed and the portfolio "
+                "was not modified."
+            )
 
             print(report)
             send_telegram(report)
@@ -956,7 +1112,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # SCHEDULED MODE: Independent risk checks first.
+    # SCHEDULED MODE: RISK CHECKS FIRST
     # --------------------------------------------------------
 
     exited_symbols, risk_messages = run_independent_exit_checks(
@@ -964,7 +1120,6 @@ def main():
         market_data=market_data,
     )
 
-    # Persist any daily reset even if Gemini later fails.
     save_portfolio(portfolio)
 
     # --------------------------------------------------------
@@ -1031,7 +1186,9 @@ def main():
                 )
 
                 if sold:
-                    execution_messages.append(f"{symbol}: AI SELL executed.")
+                    execution_messages.append(
+                        f"{symbol}: AI SELL executed."
+                    )
 
         elif action == "BUY":
             if symbol not in portfolio["holdings"]:
@@ -1060,17 +1217,22 @@ def main():
 
     report += (
         "\n\n⚠️ Paper trading only. Simulated fills use the latest "
-        "available candle price and do not include brokerage, taxes, "
-        "slippage or guaranteed execution."
+        "available candle price. Brokerage, taxes, slippage and "
+        "guaranteed execution are not included."
     )
 
     print(report)
     send_telegram(report)
 
 
+# ============================================================
+# 15. ERROR HANDLING
+# ============================================================
+
 if __name__ == "__main__":
     try:
         main()
+
     except Exception as exc:
         error_message = (
             "⚠️ INTRADAY GENAI AGENT ERROR\n"
