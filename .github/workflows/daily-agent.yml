@@ -1,26 +1,26 @@
 
-name: Daily Paper Trading Agent
+name: Intraday GenAI Paper Trading Agent
 
 on:
   schedule:
-    # 3:45 PM India time = 10:15 AM UTC
-    - cron: "15 10 * * 1-5"
+    # Every 15 minutes, Monday to Friday.
+    # UTC 03:00-09:45 = IST 08:30-15:15.
+    # Python checks actual Indian market hours.
+    - cron: "*/15 3-9 * * 1-5"
+
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 concurrency:
-  group: daily-paper-trading-agent
+  group: intraday-paper-trading
   cancel-in-progress: false
 
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -33,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install streamlit pandas numpy plotly yfinance requests supabase
 
-      - name: Run daily paper-trading scan
+      - name: Run intraday GenAI agent
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
