@@ -24,8 +24,8 @@ MAX_NEW_BUYS_PER_DAY = 2
 STOP_LOSS_PCT = 5.0
 MAX_STOCKS_PER_SCAN = 20
 
-GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_TIMEOUT = (15, 120)
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_TIMEOUT = (15, 60)
 GEMINI_RETRIES = 2
 
 
@@ -40,12 +40,9 @@ def today_ist():
 def trade_date_ist(value):
     try:
         timestamp = pd.Timestamp(value)
-
         if timestamp.tzinfo is None:
             timestamp = timestamp.tz_localize("UTC")
-
         return timestamp.tz_convert(IST).date().isoformat()
-
     except Exception:
         return ""
 
@@ -56,10 +53,8 @@ def trade_date_ist(value):
 
 url = os.environ["SUPABASE_URL"].strip()
 key = os.environ["SUPABASE_SECRET_KEY"].strip()
-
 telegram_token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
 telegram_chat_id = os.environ["TELEGRAM_CHAT_ID"].strip()
-
 gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
 parsed = urlparse(url)
@@ -81,15 +76,12 @@ def telegram(message):
             "chat_id": telegram_chat_id,
             "text": message
         },
-        timeout=20,
+        timeout=20
     )
-
     response.raise_for_status()
 
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError("Telegram API did not confirm message delivery.")
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram message delivery failed.")
 
 
 def telegram_long_message(message):
@@ -103,7 +95,7 @@ def telegram_long_message(message):
 
 
 # ============================================================
-# SUPABASE PORTFOLIO AND TRADE HISTORY
+# SUPABASE PORTFOLIO AND TRADES
 # ============================================================
 
 def load_portfolio(reset_daily_budget=True):
@@ -118,14 +110,13 @@ def load_portfolio(reset_daily_budget=True):
 
     if response.data:
         row = response.data[0]
-
     else:
         row = {
             "id": 1,
             "cash_balance": INITIAL_CASH,
             "holdings": {},
             "daily_spent": 0,
-            "last_budget_reset": today_ist(),
+            "last_budget_reset": today_ist()
         }
 
         supabase.table("paper_portfolio").insert(row).execute()
@@ -151,7 +142,7 @@ def save_portfolio(cash, holdings, spent):
         "holdings": holdings,
         "daily_spent": round(float(spent), 2),
         "last_budget_reset": today_ist(),
-        "updated_at": now_utc(),
+        "updated_at": now_utc()
     }).execute()
 
 
@@ -173,7 +164,7 @@ def load_trades():
             "Price": float(row["price"]),
             "Value": float(row["trade_value"]),
             "P&L": float(row["pnl"]),
-            "Reason": row.get("reason") or "",
+            "Reason": row.get("reason") or ""
         }
         for row in response.data
     ]
@@ -189,7 +180,7 @@ def save_trade(trade):
         "price": round(float(trade["Price"]), 2),
         "trade_value": round(float(trade["Value"]), 2),
         "pnl": round(float(trade["P&L"]), 2),
-        "reason": trade["Reason"],
+        "reason": trade["Reason"]
     }).execute()
 
 
@@ -224,19 +215,15 @@ def claim_daily_run():
 
         row = existing.data[0]
 
-        if row["status"] == "completed":
-            print(f"Daily scan already completed for {run_date}; skipping.")
-            return False
-
-        if row["status"] == "running":
-            print(f"A scan is already marked running for {run_date}; skipping.")
+        if row["status"] in ("completed", "running"):
+            print(f"Daily run already exists for {run_date}.")
             return False
 
         supabase.table("agent_runs").update({
             "status": "running",
             "started_at": now_utc(),
             "completed_at": None,
-            "summary": "Retry started",
+            "summary": "Retry started"
         }).eq("run_date", run_date).execute()
 
         return True
@@ -245,7 +232,7 @@ def claim_daily_run():
         "run_date": run_date,
         "status": "running",
         "started_at": now_utc(),
-        "summary": "Scan started",
+        "summary": "Scan started"
     }).execute()
 
     return True
@@ -256,7 +243,7 @@ def finish_daily_run(status, summary):
     supabase.table("agent_runs").update({
         "status": status,
         "completed_at": now_utc() if status == "completed" else None,
-        "summary": summary[:8000],
+        "summary": summary[:8000]
     }).eq("run_date", today_ist()).execute()
 
 
@@ -282,17 +269,16 @@ def load_stock_symbols():
                 name for name in reader.fieldnames
                 if name.strip().upper() == "SYMBOL"
             ),
-            None,
+            None
         )
 
         if not symbol_column:
-            raise ValueError("nse_stocks.csv needs a SYMBOL column.")
+            raise ValueError("CSV needs a SYMBOL column.")
 
         symbols = []
         seen = set()
 
         for row in reader:
-
             symbol = (row.get(symbol_column) or "").strip()
 
             if symbol and symbol not in seen:
@@ -312,7 +298,7 @@ def download_stock(symbol):
         interval="1d",
         auto_adjust=True,
         progress=False,
-        threads=False,
+        threads=False
     )
 
     if isinstance(data.columns, pd.MultiIndex):
@@ -327,7 +313,6 @@ def download_stock(symbol):
     df["SMA50"] = df["Close"].rolling(50).mean()
 
     change = df["Close"].diff()
-
     gains = change.clip(lower=0)
     losses = -change.clip(upper=0)
 
@@ -353,7 +338,7 @@ def decide(df, is_holding):
     rsi = latest["RSI"]
 
     if pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi):
-        return "HOLD", "Indicators are unavailable."
+        return "HOLD", "Indicators unavailable."
 
     if not is_holding and sma20 > sma50 and 35 <= rsi <= 68:
         return "BUY", "SMA20 above SMA50; RSI in entry range."
@@ -377,45 +362,41 @@ def gemini_market_analysis(stock_data, cash, holdings):
     if not stock_data:
         return "No stock data available for Gemini analysis."
 
-    url = (
+    api_url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent"
     )
 
     headers = {
         "Content-Type": "application/json",
-        "x-goog-api-key": gemini_api_key,
+        "x-goog-api-key": gemini_api_key
     }
 
+    # Keep the prompt compact to reduce processing time.
     prompt = f"""
-You are a cautious Indian stock market research assistant.
+You are an Indian stock market technical analysis assistant.
 
-Analyze the following NSE stock technical scan.
+Portfolio cash: INR {cash:.2f}
+Open positions: {len(holdings)}
 
-Portfolio cash balance: ₹{cash:.2f}
-Number of open positions: {len(holdings)}
-
-Stock scan data:
+Analyze this technical scan:
 {stock_data}
 
-Instructions:
+Provide:
+1. Overall market picture based only on supplied stocks.
+2. Strongest bullish technical patterns.
+3. Weak or bearish patterns.
+4. Important SMA20, SMA50 and RSI observations.
+5. Key risks and stocks to monitor.
 
-1. Summarize the overall technical market picture from the supplied stocks.
-2. Identify stocks with relatively stronger bullish technical patterns.
-3. Identify bearish or weak technical patterns.
-4. Explain the significance of SMA20, SMA50 and RSI values.
-5. Highlight risks and conflicting signals.
-6. Explain which signals deserve further observation.
-7. Do not invent stock prices, company news, financial results or market events.
-8. Use only the supplied technical data.
-9. Do not make guaranteed return predictions.
-10. Do not instruct the system to execute trades.
+Do not invent news, prices or financial results.
+Do not guarantee returns.
+Do not execute or recommend automatic trades.
 
-Important:
-The Python rule-based engine is responsible for all BUY, SELL and HOLD
-decisions. Your role is only to explain and interpret the supplied data.
+Python determines all BUY, SELL and HOLD signals.
+Your role is explanation only.
 
-Keep the report structured, practical and concise.
+Keep the response concise and structured.
 """
 
     payload = {
@@ -427,9 +408,11 @@ Keep the report structured, practical and concise.
             }
         ],
         "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 1200,
-        },
+            "thinkingConfig": {
+                "thinkingLevel": "minimal"
+            },
+            "maxOutputTokens": 700
+        }
     }
 
     for attempt in range(GEMINI_RETRIES):
@@ -441,16 +424,15 @@ Keep the report structured, practical and concise.
             )
 
             response = requests.post(
-                url,
+                api_url,
                 headers=headers,
                 json=payload,
-                timeout=GEMINI_TIMEOUT,
+                timeout=GEMINI_TIMEOUT
             )
 
             response.raise_for_status()
 
             result = response.json()
-
             candidates = result.get("candidates", [])
 
             if not candidates:
@@ -473,13 +455,12 @@ Keep the report structured, practical and concise.
                 print("Gemini analysis received successfully.")
                 return answer
 
-            print("Gemini response contained no text.")
             return "Gemini returned no analysis text."
 
         except requests.exceptions.ReadTimeout:
 
             print(
-                f"Gemini read timeout on attempt "
+                f"Gemini timeout on attempt "
                 f"{attempt + 1}/{GEMINI_RETRIES}."
             )
 
@@ -494,34 +475,33 @@ Keep the report structured, practical and concise.
                 else "Unknown"
             )
 
-            error_detail = (
+            detail = (
                 error.response.text[:1000]
                 if error.response is not None
                 else str(error)
             )
 
-            print(f"Gemini API HTTP error: {status}")
-            print(f"Gemini API details: {error_detail}")
+            print(f"Gemini HTTP error: {status}")
+            print(f"Gemini API details: {detail}")
 
             return f"Gemini API error ({status}). Rule-based analysis remains active."
 
         except requests.exceptions.RequestException as error:
 
-            print(
-                f"Gemini request error: {type(error).__name__}"
-            )
+            print(f"Gemini request error: {type(error).__name__}")
 
             return "Gemini connection failed. Rule-based analysis remains active."
 
         except Exception as error:
 
             print(
-                f"Gemini unexpected error: {type(error).__name__}: {error}"
+                f"Gemini unexpected error: "
+                f"{type(error).__name__}: {error}"
             )
 
             return "Gemini analysis unavailable. Rule-based analysis remains active."
 
-    print("Gemini timed out after all retry attempts.")
+    print("Gemini timed out after all attempts.")
 
     return (
         "Gemini response timed out after retry. "
@@ -530,7 +510,7 @@ Keep the report structured, practical and concise.
 
 
 # ============================================================
-# PAPER EXECUTION
+# PAPER TRADE EXECUTION
 # ============================================================
 
 def execute(
@@ -549,23 +529,16 @@ def execute(
 
     timestamp = now_utc()
 
-    # Stop-loss overrides the normal decision.
-
+    # Stop-loss check for existing positions.
     if symbol in holdings:
 
         entry = float(holdings[symbol]["entry_price"])
 
         if price <= entry * (1 - STOP_LOSS_PCT / 100):
-
             action = "SELL"
-
-            reason = (
-                f"Stop-loss reached "
-                f"({STOP_LOSS_PCT:.1f}% below entry)."
-            )
+            reason = f"Stop-loss reached ({STOP_LOSS_PCT:.1f}%)."
 
     # BUY
-
     if action == "BUY":
 
         if symbol in holdings:
@@ -585,7 +558,7 @@ def execute(
         quantity = int(investable // price)
 
         if quantity < 1:
-            return cash, holdings, spent, trades, "Insufficient budget for one share."
+            return cash, holdings, spent, trades, "Insufficient budget."
 
         value = round(quantity * price, 2)
 
@@ -600,7 +573,7 @@ def execute(
             "Price": price,
             "Value": value,
             "P&L": 0.0,
-            "Reason": reason,
+            "Reason": reason
         }
 
         new_holdings = dict(holdings)
@@ -608,23 +581,17 @@ def execute(
         new_holdings[symbol] = {
             "quantity": quantity,
             "entry_price": float(price),
-            "entry_time": timestamp,
+            "entry_time": timestamp
         }
 
         new_cash = round(cash - value, 2)
         new_spent = round(spent + value, 2)
 
         save_trade(trade)
-
-        save_portfolio(
-            new_cash,
-            new_holdings,
-            new_spent
-        )
-
+        save_portfolio(new_cash, new_holdings, new_spent)
         trades.append(trade)
 
-        message = (
+        telegram(
             f"PAPER BUY: {symbol}\n"
             f"Quantity: {quantity}\n"
             f"Reference price: ₹{price:.2f}\n"
@@ -633,18 +600,9 @@ def execute(
             f"Simulation only; no real order."
         )
 
-        telegram(message)
-
-        return (
-            new_cash,
-            new_holdings,
-            new_spent,
-            trades,
-            "BUY simulated."
-        )
+        return new_cash, new_holdings, new_spent, trades, "BUY simulated."
 
     # SELL
-
     if action == "SELL":
 
         if symbol not in holdings:
@@ -666,7 +624,7 @@ def execute(
             "Price": price,
             "Value": proceeds,
             "P&L": pnl,
-            "Reason": reason,
+            "Reason": reason
         }
 
         new_holdings = dict(holdings)
@@ -675,13 +633,7 @@ def execute(
         new_cash = round(cash + proceeds, 2)
 
         save_trade(trade)
-
-        save_portfolio(
-            new_cash,
-            new_holdings,
-            spent
-        )
-
+        save_portfolio(new_cash, new_holdings, spent)
         trades.append(trade)
 
         telegram(
@@ -694,13 +646,7 @@ def execute(
             f"Simulation only; no real order."
         )
 
-        return (
-            new_cash,
-            new_holdings,
-            spent,
-            trades,
-            f"SELL simulated; P&L ₹{pnl:.2f}"
-        )
+        return new_cash, new_holdings, spent, trades, f"SELL simulated; P&L ₹{pnl:.2f}"
 
     return cash, holdings, spent, trades, "HOLD."
 
@@ -711,18 +657,15 @@ def execute(
 
 def main():
 
-    # Manual GitHub Actions run is analysis-only.
     manual_test = (
         os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     )
 
     if not manual_test and datetime.now(IST).weekday() >= 5:
-
         print("Weekend in India; no scheduled scan performed.")
         return
 
     if not manual_test:
-
         if not claim_daily_run():
             return
 
@@ -732,13 +675,11 @@ def main():
 
     try:
 
-        # Manual mode must not reset or modify the daily budget.
         cash, holdings, spent = load_portfolio(
             reset_daily_budget=not manual_test
         )
 
         trades = load_trades()
-
         symbols = load_stock_symbols()
 
         held_symbols = [
@@ -746,7 +687,6 @@ def main():
             for symbol in holdings.keys()
         ]
 
-        # Scan normal watchlist plus every open holding.
         symbols = list(dict.fromkeys(symbols + held_symbols))
 
         for raw_symbol in symbols:
@@ -762,17 +702,12 @@ def main():
                 ticker, df = download_stock(raw_symbol)
 
                 if df.empty:
-
-                    results.append(
-                        f"{ticker}: HOLD | No price data"
-                    )
-
+                    results.append(f"{ticker}: HOLD | No price data")
                     continue
 
                 latest = df.iloc[-1]
 
                 price = float(latest["Close"])
-
                 sma20 = latest["SMA20"]
                 sma50 = latest["SMA50"]
                 rsi = latest["RSI"]
@@ -782,35 +717,20 @@ def main():
                     ticker in holdings
                 )
 
-                # Save technical data for Gemini.
                 gemini_data.append({
                     "symbol": ticker,
                     "price": round(price, 2),
-                    "SMA20": (
-                        round(float(sma20), 2)
-                        if pd.notna(sma20)
-                        else None
-                    ),
-                    "SMA50": (
-                        round(float(sma50), 2)
-                        if pd.notna(sma50)
-                        else None
-                    ),
-                    "RSI": (
-                        round(float(rsi), 2)
-                        if pd.notna(rsi)
-                        else None
-                    ),
+                    "SMA20": round(float(sma20), 2) if pd.notna(sma20) else None,
+                    "SMA50": round(float(sma50), 2) if pd.notna(sma50) else None,
+                    "RSI": round(float(rsi), 2) if pd.notna(rsi) else None,
                     "python_signal": action,
                     "reason": reason,
-                    "holding": ticker in holdings,
+                    "holding": ticker in holdings
                 })
 
                 if manual_test:
 
-                    outcome = (
-                        "Analysis-only. No paper trade executed."
-                    )
+                    outcome = "Analysis-only. No paper trade executed."
 
                 else:
 
@@ -839,17 +759,9 @@ def main():
                     f"{ticker}: ERROR — {type(error).__name__}"
                 )
 
-        # Scheduled mode saves the portfolio.
-        # Manual mode deliberately does not modify it.
         if not manual_test:
+            save_portfolio(cash, holdings, spent)
 
-            save_portfolio(
-                cash,
-                holdings,
-                spent
-            )
-
-        # Gemini analysis
         print("Starting Gemini market analysis...")
 
         gemini_analysis = gemini_market_analysis(
@@ -886,11 +798,10 @@ def main():
             *results,
             "",
             "🧠 GEMINI GENERATIVE AI ANALYSIS:",
-            gemini_analysis,
+            gemini_analysis
         ]
 
         if errors:
-
             report.extend([
                 "",
                 "⚠️ SCAN ERRORS:",
@@ -898,35 +809,26 @@ def main():
             ])
 
         if manual_test:
-
             report.extend([
                 "",
                 "ℹ️ MANUAL TEST:",
                 "No paper trades were executed.",
-                "Portfolio and daily-run record were not modified.",
+                "Portfolio and daily-run record were not modified."
             ])
-
         else:
-
             report.extend([
                 "",
                 "ℹ️ SCHEDULED RUN:",
                 "Paper-trading rules executed.",
-                "No real stock-market orders were placed.",
+                "No real stock-market orders were placed."
             ])
 
         full_report = "\n".join(report)
 
-        # Send report to Telegram.
         telegram_long_message(full_report)
 
-        # Only scheduled runs update the daily run record.
         if not manual_test:
-
-            finish_daily_run(
-                "completed",
-                full_report
-            )
+            finish_daily_run("completed", full_report)
 
         print(full_report)
 
@@ -938,20 +840,13 @@ def main():
         )
 
         if not manual_test:
-
             try:
-
-                finish_daily_run(
-                    "failed",
-                    failure
-                )
-
+                finish_daily_run("failed", failure)
             except Exception:
                 pass
 
         try:
             telegram(failure)
-
         except Exception:
             pass
 
