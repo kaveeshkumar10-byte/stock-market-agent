@@ -86,7 +86,7 @@ def is_market_hours():
 def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials not configured.")
-        return
+        return False
 
     url = (
         f"https://api.telegram.org/"
@@ -94,94 +94,84 @@ def send_telegram(message):
     )
 
     chunks = [
-        message[i:i + 3500]
-        for i in range(0, len(message), 3500)
+        message[i:i + 3900]
+        for i in range(0, len(message), 3900)
     ]
+
+    success = True
 
     for chunk in chunks:
         try:
-            requests.post(
+            response = requests.post(
                 url,
                 json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": chunk,
                 },
-                timeout=15,
-            ).raise_for_status()
+                timeout=20,
+            )
+            response.raise_for_status()
 
         except Exception as exc:
-            print(f"Telegram notification failed: {exc}")
+            print(
+                f"Telegram delivery failed: {str(exc)[:200]}"
+            )
+            success = False
+
+    return success
 
 
 # ============================================================
-# 3. PORTFOLIO MANAGEMENT
+# 3. PORTFOLIO HELPERS
 # ============================================================
-
-def empty_portfolio():
-    return {
-        "id": 1,
-        "cash_balance": DAILY_BUDGET,
-        "holdings": {},
-        "last_budget_reset": str(today_ist()),
-        "daily_spent": 0.0,
-        "updated_at": now_ist().isoformat(),
-    }
-
 
 def normalise_holdings(raw_holdings):
-    if isinstance(raw_holdings, str):
-        try:
-            raw_holdings = json.loads(raw_holdings)
-        except Exception:
-            raw_holdings = {}
-
     if not isinstance(raw_holdings, dict):
         return {}
 
-    result = {}
+    cleaned = {}
 
-    for symbol, item in raw_holdings.items():
-        if not isinstance(item, dict):
+    for symbol, holding in raw_holdings.items():
+        if not isinstance(holding, dict):
             continue
 
+        symbol = str(symbol).strip().upper()
+
         try:
-            quantity = int(
-                item.get("quantity", item.get("qty", 0))
-            )
-
-            average_price = 0.0
-
-            for candidate in (
-                item.get("average_price"),
-                item.get("entry_price"),
-                item.get("avg_price"),
-                item.get("buy_price"),
-            ):
-                if candidate is None:
-                    continue
-
-                candidate_price = float(candidate)
-
-                if candidate_price > 0:
-                    average_price = candidate_price
-                    break
-
+            quantity = int(float(holding.get("quantity", 0)))
         except (TypeError, ValueError):
             continue
 
-        normalized_symbol = str(symbol).strip().upper()
+        average_price = None
 
-        if (
-            quantity > 0
-            and average_price > 0
-            and normalized_symbol
+        for key in (
+            "average_price",
+            "entry_price",
+            "avg_price",
+            "buy_price",
         ):
-            result[normalized_symbol] = {
-                "quantity": quantity,
-                "average_price": average_price,
-            }
+            try:
+                value = holding.get(key)
 
-    return result
+                if value is not None and float(value) > 0:
+                    average_price = float(value)
+                    break
+
+            except (TypeError, ValueError):
+                continue
+
+        if quantity <= 0 or average_price is None:
+            print(
+                f"Skipping invalid holding data for {symbol}."
+            )
+            continue
+
+        cleaned[symbol] = {
+            "quantity": quantity,
+            "average_price": average_price,
+        }
+
+    return cleaned
 
 
 def load_portfolio(reset_daily_budget=False):
@@ -194,73 +184,173 @@ def load_portfolio(reset_daily_budget=False):
     )
 
     if not response.data:
-        portfolio = empty_portfolio()
+        raise RuntimeError(
+            "Portfolio record with id=1 was not found."
+        )
 
-        if reset_daily_budget:
-            supabase.table("paper_portfolio").upsert(
-                portfolio
-            ).execute()
+    row = response.data[0]
 
-        return portfolio
+    portfolio = {
+        "cash_balance": float(row.get("cash_balance") or 0),
+        "holdings": normalise_holdings(
+            row.get("holdings") or {}
+        ),
+        "daily_spent": float(row.get("daily_spent") or 0),
+        "last_budget_reset": row.get("last_budget_reset"),
+    }
 
-    portfolio = response.data[0]
+    if reset_daily_budget:
+        current_date = today_ist().isoformat()
 
-    portfolio["holdings"] = normalise_holdings(
-        portfolio.get("holdings")
-    )
+        if portfolio["last_budget_reset"] != current_date:
+            portfolio["daily_spent"] = 0.0
+            portfolio["last_budget_reset"] = current_date
 
-    portfolio["cash_balance"] = float(
-        portfolio.get("cash_balance", 0)
-    )
+            save_portfolio(portfolio)
 
-    portfolio["daily_spent"] = float(
-        portfolio.get("daily_spent", 0)
-    )
-
-    if (
-        reset_daily_budget
-        and portfolio.get("last_budget_reset") != str(today_ist())
-    ):
-        portfolio["daily_spent"] = 0.0
-        portfolio["last_budget_reset"] = str(today_ist())
-        save_portfolio(portfolio)
+            print(
+                f"Daily budget reset for {current_date}."
+            )
 
     return portfolio
 
 
 def save_portfolio(portfolio):
-    record = {
+    """
+    Used for daily budget reset and non-trade portfolio updates.
+
+    BUY and SELL transactions are handled by the database RPC
+    function and should not be overwritten by this function
+    after trade execution.
+    """
+
+    payload = {
         "id": 1,
-        "cash_balance": round(
-            float(portfolio["cash_balance"]), 2
-        ),
+        "cash_balance": float(portfolio["cash_balance"]),
         "holdings": portfolio["holdings"],
-        "last_budget_reset": portfolio.get(
-            "last_budget_reset", str(today_ist())
+        "daily_spent": float(portfolio["daily_spent"]),
+        "last_budget_reset": (
+            portfolio.get("last_budget_reset")
+            or today_ist().isoformat()
         ),
-        "daily_spent": round(
-            float(portfolio.get("daily_spent", 0)), 2
-        ),
-        "updated_at": now_ist().isoformat(),
+        "updated_at": datetime.now(IST).isoformat(),
     }
 
-    supabase.table("paper_portfolio").upsert(record).execute()
+    (
+        supabase.table("paper_portfolio")
+        .upsert(payload, on_conflict="id")
+        .execute()
+    )
 
 
 # ============================================================
-# 4. NSE STOCK UNIVERSE
+# 4. TRADE HISTORY HELPERS
 # ============================================================
 
-def load_stock_universe(portfolio):
-    if not os.path.exists("nse_stocks.csv"):
+def get_today_buy_count():
+    start = datetime.combine(
+        today_ist(),
+        dt_time.min,
+    ).replace(tzinfo=IST)
+
+    end = datetime.combine(
+        today_ist(),
+        dt_time.max,
+    ).replace(tzinfo=IST)
+
+    response = (
+        supabase.table("paper_trades")
+        .select("id")
+        .eq("action", "BUY")
+        .gte("trade_time", start.isoformat())
+        .lte("trade_time", end.isoformat())
+        .execute()
+    )
+
+    return len(response.data or [])
+
+
+def create_idempotency_key(symbol, action):
+    return (
+        f"{today_ist().isoformat()}:"
+        f"{action.upper()}:"
+        f"{symbol.upper()}"
+    )
+
+
+def trade_already_recorded(symbol, action):
+    key = create_idempotency_key(symbol, action)
+
+    response = (
+        supabase.table("paper_trades")
+        .select("id")
+        .eq("idempotency_key", key)
+        .limit(1)
+        .execute()
+    )
+
+    return bool(response.data)
+
+
+# ============================================================
+# 5. TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    average_gain = gain.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
+    ).mean()
+
+    average_loss = loss.ewm(
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False,
+    ).mean()
+
+    relative_strength = (
+        average_gain / average_loss.replace(0, float("nan"))
+    )
+
+    rsi = 100 - (100 / (1 + relative_strength))
+
+    rsi = rsi.mask(
+        (average_loss == 0) & (average_gain > 0),
+        100,
+    )
+
+    rsi = rsi.mask(
+        (average_gain == 0) & (average_loss > 0),
+        0,
+    )
+
+    return rsi
+
+
+# ============================================================
+# 6. MARKET DATA
+# ============================================================
+
+def get_stock_universe():
+    csv_path = "nse_stocks.csv"
+
+    if not os.path.exists(csv_path):
         raise FileNotFoundError(
             "nse_stocks.csv was not found in the repository."
         )
 
-    stocks_df = pd.read_csv("nse_stocks.csv")
+    stocks_df = pd.read_csv(csv_path)
 
     if stocks_df.empty:
-        raise RuntimeError("nse_stocks.csv is empty.")
+        raise RuntimeError(
+            "nse_stocks.csv contains no stocks."
+        )
 
     possible_columns = [
         "symbol",
@@ -276,109 +366,53 @@ def load_stock_universe(portfolio):
             for column in possible_columns
             if column in stocks_df.columns
         ),
-        stocks_df.columns[0],
+        None,
     )
 
-    all_symbols = []
+    if symbol_column is None:
+        raise RuntimeError(
+            "Could not identify the stock symbol column "
+            "in nse_stocks.csv."
+        )
 
-    for value in stocks_df[symbol_column].dropna().astype(str):
-        symbol = value.strip().upper()
+    symbols = []
 
-        if not symbol or symbol == "NAN":
+    for value in stocks_df[symbol_column].dropna():
+        symbol = str(value).strip().upper()
+
+        if not symbol:
             continue
 
         if not symbol.endswith(".NS"):
             symbol += ".NS"
 
-        if symbol not in all_symbols:
-            all_symbols.append(symbol)
+        if symbol not in symbols:
+            symbols.append(symbol)
 
-    selected_symbols = all_symbols[:MAX_STOCKS]
-
-    for symbol in portfolio["holdings"]:
-        if symbol not in selected_symbols:
-            selected_symbols.append(symbol)
-
-    print(f"Total stocks in CSV: {len(all_symbols)}")
-    print(f"Maximum CSV stocks selected: {MAX_STOCKS}")
-    print(f"Existing holdings added: {len(portfolio['holdings'])}")
-    print(f"Total stocks selected: {len(selected_symbols)}")
-
-    return selected_symbols
+    return symbols[:MAX_STOCKS]
 
 
-# ============================================================
-# 5. TECHNICAL INDICATORS
-# ============================================================
-
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
-
-    average_gain = gains.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False,
-    ).mean()
-
-    average_loss = losses.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False,
-    ).mean()
-
-    relative_strength = (
-        average_gain
-        / average_loss.replace(0, float("nan"))
-    )
-
-    return 100 - (100 / (1 + relative_strength))
-
-
-def clean_yfinance_columns(df):
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [
-            column[0] if isinstance(column, tuple) else column
-            for column in df.columns
-        ]
-
-    df.columns = [
-        str(column).title()
-        for column in df.columns
-    ]
-
-    return df
-
-
-# ============================================================
-# 6. INTRADAY MARKET DATA
-# ============================================================
-
-def download_intraday(symbol, manual_mode):
+def download_intraday(symbol, manual_mode=False):
     try:
-        df = yf.download(
-            symbol,
+        ticker = yf.Ticker(symbol)
+
+        df = ticker.history(
             period="5d",
             interval="5m",
             auto_adjust=True,
-            progress=False,
-            threads=False,
             prepost=False,
         )
 
         if df is None or df.empty:
             return None, (
-                f"{symbol}: Yahoo Finance returned no data."
+                f"{symbol}: No valid price candles."
             )
 
-        df = clean_yfinance_columns(df)
-
         required_columns = [
-            "Close",
+            "Open",
             "High",
             "Low",
+            "Close",
             "Volume",
         ]
 
@@ -387,20 +421,16 @@ def download_intraday(symbol, manual_mode):
             for column in required_columns
         ):
             return None, (
-                f"{symbol}: Required price columns are missing."
+                f"{symbol}: Required market data columns missing."
             )
 
-        df = df[required_columns].copy()
-
         df = df.dropna(
-            subset=["Close", "High", "Low"]
-        )
-
-        df = df[df["Close"] > 0]
+            subset=["High", "Low", "Close"]
+        ).copy()
 
         if df.empty:
             return None, (
-                f"{symbol}: No valid price candles."
+                f"{symbol}: No valid price candles after cleaning."
             )
 
         index = pd.to_datetime(df.index)
@@ -529,197 +559,183 @@ def collect_market_data(symbols, manual_mode):
                 result, error = future.result()
 
                 if result:
-                    market_data[result["symbol"]] = result
+                    market_data[symbol] = result
 
                 if error:
                     errors.append(error)
 
             except Exception as exc:
                 errors.append(
-                    f"{symbol}: {str(exc)[:180]}"
+                    f"{symbol}: Unexpected processing error: "
+                    f"{str(exc)[:150]}"
                 )
 
     return market_data, errors
- # ============================================================
-# 7. GEMINI RESPONSE PARSING
+
+
+# ============================================================
+# 7. GEMINI AI ANALYSIS
 # ============================================================
 
-def extract_json(text):
-    text = text.strip()
+def build_gemini_prompt(market_data, portfolio):
+    holdings = portfolio.get("holdings", {})
 
-    text = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-    )
+    market_lines = []
 
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text,
-    )
-
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1:
-        raise ValueError(
-            "Gemini response did not contain valid JSON."
+    for symbol, data in market_data.items():
+        holding_text = (
+            "CURRENTLY HELD"
+            if symbol in holdings
+            else "NOT HELD"
         )
 
-    return json.loads(text[start:end + 1])
+        market_lines.append(
+            f"""
+Symbol: {symbol}
+Holding status: {holding_text}
+Price: {data['price']}
+EMA9: {data['ema9']}
+EMA21: {data['ema21']}
+RSI: {data['rsi']}
+VWAP: {data['vwap']}
+Latest candle volume: {data['volume']}
+Candle time: {data['candle_time']}
+"""
+        )
 
+    market_text = "\n".join(market_lines)
 
-# ============================================================
-# 8. COMPACT GEMINI PAYLOAD
-# ============================================================
-
-def create_compact_market_data(market_data):
-    compact_data = []
-
-    for item in market_data.values():
-        compact_data.append({
-            "symbol": item["symbol"],
-            "price": item["price"],
-            "ema9": item["ema9"],
-            "ema21": item["ema21"],
-            "rsi": item["rsi"],
-            "vwap": item["vwap"],
-            "volume": item["volume"],
-        })
-
-    return compact_data
-
-
-# ============================================================
-# 9. GEMINI RANKED DECISION ENGINE
-# ============================================================
-
-def gemini_decisions(market_data, portfolio, manual_mode):
-    compact_data = create_compact_market_data(market_data)
-
-    session_dates = sorted({
-        item["session_date"]
-        for item in market_data.values()
-    })
-
-    mode_description = (
-        "HISTORICAL ANALYSIS ONLY. These are not live prices. "
-        "No trades will be executed."
-        if manual_mode
-        else "INTRADAY ANALYSIS using available market candles."
+    holdings_text = json.dumps(
+        holdings,
+        ensure_ascii=False,
     )
 
-    holdings_summary = {
-        symbol: {
-            "quantity": item["quantity"],
-            "average_price": item["average_price"],
-        }
-        for symbol, item in portfolio["holdings"].items()
-    }
+    return f"""
+You are an equity market research assistant analysing
+Indian NSE stocks for an INTRADAY PAPER-TRADING system.
 
-    prompt = f"""
-You are an AI analysis engine for an NSE intraday
-PAPER-TRADING system.
-
-MODE: {mode_description}
-
-DATA SESSION: {session_dates}
-
-Analyse every supplied stock and rank them by signal quality.
-
-INDICATORS:
-1. EMA9 versus EMA21: trend direction.
-2. RSI: momentum.
-3. Price versus VWAP: intraday strength.
-4. Volume: participation and signal reliability.
-5. Existing holdings: relevant SELL decisions.
-
-SIGNAL SCORE: 0 TO 100
-
-Use this scoring framework:
-- Trend alignment: 0-25.
-- RSI momentum: 0-20.
-- VWAP confirmation: 0-20.
-- Volume confirmation: 0-20.
-- Overall signal consistency: 0-15.
-
-BUY CANDIDATE:
-- EMA9 above EMA21.
-- Price above VWAP.
-- RSI preferably between 50 and 70.
-- Positive volume.
-- Multiple indicators should support the decision.
-
-SELL CANDIDATE:
-- Stock must already be held.
-- EMA9 below EMA21 or clear weakening momentum.
-- Price below VWAP adds confirmation.
-- Explain the exit reason.
-
-HOLD:
-- Indicators conflict.
-- Volume is zero or unreliable.
-- RSI is extremely overbought or oversold without confirmation.
-- Signal is weak or unclear.
+Your task is to independently analyse the supplied market data
+and rank the strongest potential trading opportunities.
 
 IMPORTANT:
-- Signal score is NOT probability of profit.
-- Never invent prices, indicators, news or events.
-- Never recommend BUY for an existing holding.
-- Never recommend SELL for a stock not held.
-- Do not force BUY or SELL.
-- HOLD is a valid decision.
-- Rank every supplied stock.
-- Give a short explanation based on actual supplied data.
-- Return exactly one decision per supplied stock.
+- Analyse only the supplied data.
+- Do not invent prices, indicators, news, or market facts.
+- Do not assume that a BUY signal guarantees profit.
+- Do not recommend a BUY for a stock already held.
+- Recommend SELL only for stocks marked CURRENTLY HELD.
+- Use HOLD when the evidence is weak, mixed, or incomplete.
+- This is paper trading only, not real-money trading.
 
-PORTFOLIO:
-{json.dumps(holdings_summary, separators=(",", ":"))}
+SIGNAL SCORING FRAMEWORK (0–100):
 
-MARKET DATA:
-{json.dumps(compact_data, separators=(",", ":"))}
+1. Trend strength: 0–25
+   - EMA9 above EMA21 supports bullish momentum.
+   - Stronger separation can indicate stronger momentum.
 
-Return valid JSON only:
+2. RSI: 0–20
+   - RSI between 50 and 70 can support bullish momentum.
+   - RSI above 70 may indicate overbought conditions.
+   - RSI below 50 weakens a bullish case.
+
+3. VWAP position: 0–20
+   - Price above VWAP supports intraday buying strength.
+   - Price below VWAP weakens the bullish case.
+
+4. Volume: 0–20
+   - Positive and meaningful volume supports participation.
+   - Zero or missing volume should receive a low score.
+
+5. Indicator consistency: 0–15
+   - Reward agreement between trend, RSI, VWAP, and volume.
+   - Penalise conflicting signals.
+
+DECISION GUIDANCE:
+- BUY: Strong bullish setup with a score preferably 70 or higher.
+- SELL: Existing holding with weakening momentum or risk.
+- HOLD: No clear opportunity or insufficient evidence.
+
+For every stock, return:
+- symbol
+- decision: BUY, SELL, or HOLD
+- signal_score: integer from 0 to 100
+- rank: integer, with 1 being the strongest opportunity
+- reason: concise explanation using the supplied indicators
+
+Return valid JSON only, in exactly this structure:
 
 {{
-  "market_view": "Overall market observation",
-  "ranked_stocks": [
+  "market_view": "A concise summary of the overall market sample.",
+  "decisions": [
     {{
+      "symbol": "ABC.NS",
+      "decision": "BUY",
+      "signal_score": 75,
       "rank": 1,
-      "symbol": "RELIANCE.NS",
-      "action": "BUY",
-      "signal_score": 82,
-      "reason": "Explanation using actual indicators"
+      "reason": "EMA9 is above EMA21, price is above VWAP, and RSI supports bullish momentum."
     }}
   ]
 }}
+
+CURRENT PORTFOLIO HOLDINGS:
+{holdings_text}
+
+MARKET DATA:
+{market_text}
 """
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 2500,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {
-                "thinkingLevel": "minimal"
-            },
-        },
-    }
+
+def extract_json_response(text_response):
+    cleaned = text_response.strip()
+
+    cleaned = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = re.sub(
+        r"\s*```$",
+        "",
+        cleaned,
+    )
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("Gemini did not return a valid JSON object.")
+
+    return json.loads(cleaned[start:end + 1])
+
+
+def call_gemini(market_data, portfolio):
+    prompt = build_gemini_prompt(market_data, portfolio)
 
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
     }
 
-    for attempt in range(2):
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt,
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    last_error = None
+
+    for attempt in range(1, 3):
         try:
             response = requests.post(
                 GEMINI_URL,
@@ -730,186 +746,179 @@ Return valid JSON only:
 
             if response.status_code == 429:
                 raise RuntimeError(
-                    "Gemini free-tier quota exceeded (HTTP 429). "
-                    "Check your Gemini API quota and try again "
-                    "after it resets."
+                    "Gemini API rate limit reached (HTTP 429)."
                 )
 
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Gemini HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
-                )
+            response.raise_for_status()
 
-            result = response.json()
+            response_data = response.json()
 
-            response_text = (
-                result["candidates"][0]["content"]["parts"][0]["text"]
+            candidates = response_data.get(
+                "candidates", []
             )
 
-            return extract_json(response_text)
+            if not candidates:
+                raise ValueError(
+                    "Gemini returned no candidates."
+                )
 
-        except RuntimeError:
-            raise
+            parts = (
+                candidates[0]
+                .get("content", {})
+                .get("parts", [])
+            )
+
+            response_text = "".join(
+                part.get("text", "")
+                for part in parts
+            )
+
+            if not response_text.strip():
+                raise ValueError(
+                    "Gemini returned an empty response."
+                )
+
+            return extract_json_response(response_text)
 
         except Exception as exc:
-            print(
-                f"Gemini attempt {attempt + 1} failed: {exc}"
-            )
+            last_error = exc
 
-            if attempt == 0:
-                time.sleep(3)
-            else:
-                raise RuntimeError(
-                    f"Gemini request failed: {exc}"
-                )
+            if "429" in str(exc):
+                break
+
+            if attempt < 2:
+                time.sleep(2)
+
+    raise RuntimeError(
+        f"Gemini analysis failed: {str(last_error)[:250]}"
+    )
 
 
 # ============================================================
-# 10. VALIDATE AND RANK DECISIONS
+# 8. DECISION VALIDATION
 # ============================================================
 
 def validate_decisions(ai_result, market_data, portfolio):
-    validated = {}
-
-    raw_decisions = ai_result.get("ranked_stocks", [])
+    raw_decisions = ai_result.get("decisions", [])
 
     if not isinstance(raw_decisions, list):
-        raw_decisions = []
+        raise ValueError("Gemini decisions field is not a list.")
+
+    holdings = portfolio.get("holdings", {})
+    validated = []
+    seen_symbols = set()
 
     for item in raw_decisions:
         if not isinstance(item, dict):
             continue
 
-        symbol = str(
-            item.get("symbol", "")
-        ).upper().strip()
+        symbol = str(item.get("symbol", "")).strip().upper()
+        decision = str(item.get("decision", "HOLD")).strip().upper()
 
-        if (
-            symbol not in market_data
-            or symbol in validated
-        ):
+        if symbol not in market_data:
             continue
 
-        action = str(
-            item.get("action", "HOLD")
-        ).upper().strip()
+        if symbol in seen_symbols:
+            continue
 
-        if action not in {"BUY", "SELL", "HOLD"}:
-            action = "HOLD"
+        seen_symbols.add(symbol)
+
+        if decision not in ("BUY", "SELL", "HOLD"):
+            decision = "HOLD"
 
         try:
-            score = int(item.get("signal_score", 0))
-        except (ValueError, TypeError):
+            score = int(float(item.get("signal_score", 0)))
+        except (TypeError, ValueError):
             score = 0
 
         score = max(0, min(100, score))
 
-        data = market_data[symbol]
-
-        if action == "BUY":
-            if (
-                score < MIN_BUY_SCORE
-                or symbol in portfolio["holdings"]
-                or data["ema9"] <= data["ema21"]
-                or data["price"] <= data["vwap"]
-                or data["volume"] <= 0
-                or data["rsi"] < 50
-                or data["rsi"] > 70
-            ):
-                action = "HOLD"
-
-        if (
-            action == "SELL"
-            and symbol not in portfolio["holdings"]
-        ):
-            action = "HOLD"
-
         try:
-            rank = int(item.get("rank", 999))
-        except (ValueError, TypeError):
-            rank = 999
+            original_rank = int(float(item.get("rank", 999)))
+        except (TypeError, ValueError):
+            original_rank = 999
 
-        validated[symbol] = {
-            "action": action,
-            "confidence": score,
-            "reason": str(
-                item.get(
-                    "reason",
-                    "No explanation provided.",
+        reason = str(item.get("reason", "")).strip()
+
+        if not reason:
+            reason = "No detailed explanation was provided."
+
+        data = market_data[symbol]
+        is_held = symbol in holdings
+
+        if decision == "BUY":
+            if is_held:
+                decision = "HOLD"
+                reason = (
+                    "Already held in the portfolio; new BUY rejected."
                 )
-            )[:300],
-            "rank": rank,
-        }
+
+            elif score < MIN_BUY_SCORE:
+                decision = "HOLD"
+                reason = (
+                    f"Signal score {score} is below the "
+                    f"minimum BUY threshold of {MIN_BUY_SCORE}."
+                )
+
+            elif data["ema9"] <= data["ema21"]:
+                decision = "HOLD"
+                reason = "BUY rejected: EMA9 is not above EMA21."
+
+            elif data["price"] <= data["vwap"]:
+                decision = "HOLD"
+                reason = "BUY rejected: price is not above VWAP."
+
+            elif data["volume"] <= 0:
+                decision = "HOLD"
+                reason = "BUY rejected: latest candle volume is zero."
+
+            elif not (50 <= data["rsi"] <= 70):
+                decision = "HOLD"
+                reason = (
+                    "BUY rejected: RSI is outside the permitted "
+                    "50–70 range."
+                )
+
+        elif decision == "SELL":
+            if not is_held:
+                decision = "HOLD"
+                reason = "SELL rejected: stock is not currently held."
+
+        validated.append({
+            "symbol": symbol,
+            "decision": decision,
+            "signal_score": score,
+            "original_rank": original_rank,
+            "reason": reason[:300],
+        })
 
     for symbol in market_data:
-        if symbol not in validated:
-            validated[symbol] = {
-                "action": "HOLD",
-                "confidence": 0,
-                "reason": "No valid AI decision received.",
-                "rank": 999,
-            }
+        if symbol not in seen_symbols:
+            validated.append({
+                "symbol": symbol,
+                "decision": "HOLD",
+                "signal_score": 0,
+                "original_rank": 999,
+                "reason": "No decision returned by Gemini.",
+            })
 
-    validated = dict(
-        sorted(
-            validated.items(),
-            key=lambda item: (
-                item[1]["rank"],
-                -item[1]["confidence"],
-            ),
+    validated.sort(
+        key=lambda item: (
+            item["original_rank"],
+            -item["signal_score"],
         )
     )
+
+    # Assign clean sequential ranks for display.
+    for index, item in enumerate(validated, start=1):
+        item["rank"] = index
+        item.pop("original_rank", None)
 
     return validated
 
 
 # ============================================================
-# 11. TRADE HISTORY AND DUPLICATE PROTECTION
-# ============================================================
-
-def get_todays_trades():
-    start = datetime.combine(
-        today_ist(),
-        dt_time.min,
-    ).replace(tzinfo=IST)
-
-    response = (
-        supabase.table("paper_trades")
-        .select("*")
-        .gte("trade_time", start.isoformat())
-        .execute()
-    )
-
-    return response.data or []
-
-
-def create_idempotency_key(symbol, action):
-    trade_date = today_ist().isoformat()
-
-    return (
-        f"{trade_date}:"
-        f"{action.upper()}:"
-        f"{symbol.upper()}"
-    )
-
-
-def trade_already_recorded(symbol, action):
-    key = create_idempotency_key(symbol, action)
-
-    response = (
-        supabase.table("paper_trades")
-        .select("idempotency_key")
-        .eq("idempotency_key", key)
-        .limit(1)
-        .execute()
-    )
-
-    return bool(response.data)
-
-
-# ============================================================
-# 12. DATABASE TRANSACTION EXECUTION
+# 9. DATABASE TRADE EXECUTION
 # ============================================================
 
 def execute_database_trade(
@@ -920,8 +929,10 @@ def execute_database_trade(
     reason,
 ):
     """
-    Executes the trade and portfolio update together
-    using the PostgreSQL execute_paper_trade function.
+    Execute a trade through the PostgreSQL RPC function.
+
+    The database function updates paper_portfolio and inserts
+    paper_trades in one atomic database transaction.
     """
 
     response = supabase.rpc(
@@ -942,39 +953,62 @@ def execute_database_trade(
 
     if not isinstance(result, dict):
         raise RuntimeError(
-            f"Unexpected database response: {result}"
+            "Database trade function returned an unexpected response."
         )
 
-    if not result.get("success"):
-        raise RuntimeError(
-            result.get(
-                "message",
-                "Database did not confirm the trade.",
-            )
+    if result.get("success") is True:
+        print(
+            f"Database trade executed: {action} "
+            f"{quantity} {symbol} at ₹{price:.2f}"
         )
+        return result
 
-    return result   
- # ============================================================
-# 13. PAPER SELL — ATOMIC DATABASE TRANSACTION
+    if result.get("status") == "duplicate":
+        print(
+            f"Duplicate trade blocked: {action} {symbol}"
+        )
+        return result
+
+    raise RuntimeError(
+        result.get(
+            "message",
+            "Database rejected the trade."
+        )
+    )
+
+
+# ============================================================
+# 10. BUY AND SELL EXECUTION
 # ============================================================
 
-def execute_sell(portfolio, symbol, price, reason):
-    holding = portfolio["holdings"].get(symbol)
+def execute_sell(
+    portfolio,
+    symbol,
+    price,
+    reason,
+):
+    holdings = portfolio.get("holdings", {})
 
-    if not holding:
+    if symbol not in holdings:
+        print(f"SELL skipped: {symbol} is not held.")
+        return False
+
+    holding = holdings[symbol]
+
+    quantity = int(holding.get("quantity", 0))
+    average_price = float(
+        holding.get("average_price", 0)
+    )
+
+    if quantity <= 0 or price <= 0 or average_price <= 0:
+        print(f"SELL skipped: Invalid holding data for {symbol}.")
         return False
 
     if trade_already_recorded(symbol, "SELL"):
-        print(f"Duplicate SELL blocked for {symbol}.")
+        print(
+            f"SELL skipped: {symbol} already sold today."
+        )
         return False
-
-    quantity = int(holding["quantity"])
-    average_price = float(holding["average_price"])
-
-    if price <= 0 or quantity <= 0:
-        return False
-
-    pnl = (price - average_price) * quantity
 
     try:
         result = execute_database_trade(
@@ -985,84 +1019,82 @@ def execute_sell(portfolio, symbol, price, reason):
             reason=reason,
         )
 
-        # Update local state only after database confirmation.
-        portfolio["cash_balance"] += quantity * price
-        del portfolio["holdings"][symbol]
+        if result.get("status") == "duplicate":
+            return False
 
-        send_telegram(
-            f"📤 PAPER SELL: {symbol}\n"
-            f"Quantity: {quantity}\n"
-            f"Simulated price: ₹{price:.2f}\n"
-            f"Realised P&L: ₹{pnl:.2f}\n"
-            f"Reason: {reason}"
+        portfolio["cash_balance"] = (
+            float(portfolio["cash_balance"])
+            + (quantity * price)
         )
 
-        print(f"Atomic SELL completed: {result}")
+        portfolio["holdings"].pop(symbol, None)
 
         return True
 
     except Exception as exc:
-        print(f"Atomic SELL failed for {symbol}: {exc}")
+        print(
+            f"SELL failed for {symbol}: {str(exc)[:200]}"
+        )
         return False
 
-
-# ============================================================
-# 14. PAPER BUY — ATOMIC DATABASE TRANSACTION
-# ============================================================
 
 def execute_buy(
     portfolio,
     symbol,
     price,
     reason,
-    confidence,
+    confidence=None,
 ):
-    if symbol in portfolio["holdings"]:
-        return False, "Already holding this stock."
+    holdings = portfolio.get("holdings", {})
 
-    if trade_already_recorded(symbol, "BUY"):
-        return False, "Duplicate BUY blocked for today."
-
-    if now_ist().time() >= NO_NEW_BUYS_AFTER:
-        return False, "New BUY cutoff time has passed."
+    if symbol in holdings:
+        print(f"BUY skipped: {symbol} is already held.")
+        return False, "Stock is already held."
 
     if price <= 0:
-        return False, "Invalid price."
+        print(f"BUY skipped: Invalid price for {symbol}.")
+        return False, "Invalid stock price."
 
-    todays_trades = get_todays_trades()
+    if trade_already_recorded(symbol, "BUY"):
+        print(
+            f"BUY skipped: {symbol} already bought today."
+        )
+        return False, "Duplicate BUY blocked."
 
-    todays_buys = sum(
-        1
-        for trade in todays_trades
-        if str(trade.get("action", "")).upper() == "BUY"
-    )
+    buy_count = get_today_buy_count()
 
-    if todays_buys >= MAX_NEW_BUYS_PER_DAY:
-        return False, "Daily maximum of 2 BUY trades reached."
+    if buy_count >= MAX_NEW_BUYS_PER_DAY:
+        return False, "Maximum daily BUY limit reached."
 
-    remaining_budget = (
-        DAILY_BUDGET - portfolio["daily_spent"]
+    cash_balance = float(portfolio["cash_balance"])
+    daily_spent = float(portfolio.get("daily_spent", 0))
+
+    remaining_daily_budget = max(
+        0.0,
+        DAILY_BUDGET - daily_spent,
     )
 
     allocation = min(
         MAX_PER_STOCK,
-        remaining_budget,
-        portfolio["cash_balance"],
+        cash_balance,
+        remaining_daily_budget,
     )
-
-    if allocation < price:
-        return False, "Insufficient available budget or cash."
 
     quantity = int(allocation // price)
 
     if quantity <= 0:
-        return False, "Allocation is insufficient for one share."
+        return False, "Insufficient budget to buy even one share."
 
     trade_value = quantity * price
 
-    trade_reason = (
-        f"{reason} | Signal score: {confidence}"
-    )
+    if trade_value > MAX_PER_STOCK:
+        return False, "Per-stock limit exceeded."
+
+    if trade_value > cash_balance:
+        return False, "Insufficient portfolio cash."
+
+    if daily_spent + trade_value > DAILY_BUDGET:
+        return False, "Daily budget exceeded."
 
     try:
         result = execute_database_trade(
@@ -1070,391 +1102,345 @@ def execute_buy(
             action="BUY",
             quantity=quantity,
             price=price,
-            reason=trade_reason,
+            reason=reason,
         )
 
-        # Update local state only after database confirmation.
-        portfolio["cash_balance"] -= trade_value
-        portfolio["daily_spent"] += trade_value
+        if result.get("status") == "duplicate":
+            return False, "Duplicate BUY blocked."
+
+        portfolio["cash_balance"] = (
+            cash_balance - trade_value
+        )
+
+        portfolio["daily_spent"] = (
+            daily_spent + trade_value
+        )
 
         portfolio["holdings"][symbol] = {
             "quantity": quantity,
-            "average_price": round(price, 2),
+            "average_price": price,
         }
 
-        send_telegram(
-            f"📥 PAPER BUY: {symbol}\n"
-            f"Quantity: {quantity}\n"
-            f"Simulated price: ₹{price:.2f}\n"
-            f"Trade value: ₹{trade_value:.2f}\n"
-            f"Signal score: {confidence}/100\n"
-            f"Reason: {reason}"
-        )
-
-        print(f"Atomic BUY completed: {result}")
-
         return True, (
-            "BUY executed through atomic database transaction."
+            f"BUY executed: {quantity} shares at "
+            f"₹{price:.2f}; value ₹{trade_value:.2f}."
         )
 
     except Exception as exc:
-        print(f"Atomic BUY failed for {symbol}: {exc}")
-
-        return False, (
-            f"Database transaction failed: {str(exc)[:200]}"
+        print(
+            f"BUY failed for {symbol}: {str(exc)[:200]}"
         )
+        return False, f"Database execution failed: {str(exc)[:120]}"
 
 
 # ============================================================
-# 15. INDEPENDENT RISK CHECKS
+# 11. INDEPENDENT RISK MANAGEMENT
 # ============================================================
 
-def run_independent_exit_checks(
-    portfolio,
-    market_data,
-):
-    exited_symbols = set()
-    messages = []
+def run_independent_exit_checks(portfolio, market_data):
+    """
+    Check stop-loss and forced square-off independently of Gemini.
+    """
 
     current_time = now_ist().time()
+    holdings = list(portfolio.get("holdings", {}).keys())
 
-    square_off_due = (
-        current_time >= SQUARE_OFF_AFTER
-    )
+    if not holdings:
+        return []
 
-    for symbol in list(portfolio["holdings"].keys()):
-        market = market_data.get(symbol)
+    exit_messages = []
 
-        if not market:
-            messages.append(
-                f"{symbol}: Exit check unavailable; "
-                "fresh market data missing."
+    for symbol in holdings:
+        data = market_data.get(symbol)
+
+        if not data:
+            print(
+                f"Risk check skipped for {symbol}: "
+                "No valid current market data."
             )
             continue
 
-        price = float(market["price"])
+        holding = portfolio["holdings"].get(symbol, {})
 
-        holding = portfolio["holdings"].get(symbol)
-
-        if not holding:
-            continue
-
+        quantity = int(holding.get("quantity", 0))
         average_price = float(
-            holding["average_price"]
+            holding.get("average_price", 0)
         )
 
-        stop_price = (
+        price = float(data.get("price", 0))
+
+        if quantity <= 0 or average_price <= 0 or price <= 0:
+            continue
+
+        loss_threshold = (
             average_price * (1 - STOP_LOSS_PERCENT)
         )
 
-        if price <= stop_price:
+        should_sell = False
+        reason = ""
+
+        if price <= loss_threshold:
+            should_sell = True
             reason = (
-                "Python risk control: 5% stop-loss threshold reached. "
-                f"Entry ₹{average_price:.2f}; "
-                f"latest price ₹{price:.2f}."
+                f"Automatic stop-loss triggered: price ₹{price:.2f} "
+                f"is at least {STOP_LOSS_PERCENT * 100:.0f}% "
+                f"below average entry ₹{average_price:.2f}."
             )
 
-            if execute_sell(
+        elif current_time >= SQUARE_OFF_AFTER:
+            should_sell = True
+            reason = (
+                "Mandatory intraday square-off after 15:10 IST."
+            )
+
+        if should_sell:
+            success = execute_sell(
                 portfolio,
                 symbol,
                 price,
                 reason,
-            ):
-                exited_symbols.add(symbol)
-
-                messages.append(
-                    f"{symbol}: Sold by independent stop-loss rule."
-                )
-
-        elif square_off_due:
-            reason = (
-                "Python risk control: End-of-day square-off."
             )
 
-            if execute_sell(
-                portfolio,
-                symbol,
-                price,
-                reason,
-            ):
-                exited_symbols.add(symbol)
+            if success:
+                pnl = (price - average_price) * quantity
 
-                messages.append(
-                    f"{symbol}: Sold by end-of-day square-off."
+                exit_messages.append(
+                    f"SELL {symbol}: {quantity} shares at "
+                    f"₹{price:.2f}; P&L ₹{pnl:.2f}. "
+                    f"Reason: {reason}"
                 )
 
-    return exited_symbols, messages
+    return exit_messages
 
 
 # ============================================================
-# 16. TELEGRAM ANALYSIS REPORT
+# 12. REPORTING
 # ============================================================
 
 def build_report(
     manual_mode,
     market_data,
     errors,
-    ai_result=None,
-    decisions=None,
+    ai_result,
+    decisions,
     risk_messages=None,
 ):
+    current = now_ist()
+
+    if market_data:
+        analysis_date = next(
+            iter(market_data.values())
+        ).get("session_date")
+    else:
+        analysis_date = today_ist().isoformat()
+
     mode = (
         "MANUAL ANALYSIS — NO TRADES EXECUTED"
         if manual_mode
-        else "SCHEDULED INTRADAY PAPER-TRADING RUN"
+        else "SCHEDULED PAPER-TRADING MODE"
     )
 
-    report = [
+    lines = [
         "📊 INTRADAY GENAI AGENT",
         f"Mode: {mode}",
-        (
-            f"Time: {now_ist().strftime('%d-%b-%Y %I:%M %p IST')}"
-        ),
+        f"Time: {current.strftime('%d-%b-%Y %I:%M %p IST')}",
         f"Stocks analysed: {len(market_data)}",
+        f"Data session: {analysis_date}",
     ]
 
-    if market_data:
-        sessions = sorted({
-            item["session_date"]
-            for item in market_data.values()
-        })
-
-        report.append(
-            f"Data session: {', '.join(sessions)}"
+    if manual_mode:
+        lines.append(
+            "Note: Manual analysis may use historical candles."
         )
 
-        if manual_mode:
-            report.append(
-                "Note: Manual analysis may use historical candles."
-            )
+    lines.extend([
+        "",
+        "Market view:",
+        ai_result.get(
+            "market_view",
+            "No market summary available.",
+        ),
+        "",
+        "RANKED AI DECISIONS:",
+    ])
 
-    if ai_result:
-        report.extend([
-            "",
-            "Market view:",
-            str(
-                ai_result.get(
-                    "market_view",
-                    "Not provided",
-                )
-            )[:500],
-        ])
-
-    if decisions:
-        report.append("")
-        report.append("RANKED AI DECISIONS:")
-
-        for symbol, decision in decisions.items():
-            report.append(
-                f"#{decision['rank']} {symbol}: "
-                f"{decision['action']} | "
-                f"Signal score: {decision['confidence']}/100 | "
-                f"{decision['reason']}"
-            )
+    for item in decisions:
+        lines.append(
+            f"#{item['rank']} {item['symbol']}: "
+            f"{item['decision']} | "
+            f"Signal score: {item['signal_score']}/100 | "
+            f"{item['reason']}"
+        )
 
     if risk_messages:
-        report.append("")
-        report.append("RISK CHECKS / EXECUTION:")
-        report.extend(risk_messages)
+        lines.extend([
+            "",
+            "EXECUTION AND RISK MANAGEMENT:",
+            *risk_messages,
+        ])
 
     if errors:
-        report.append("")
-        report.append(
-            f"Data issues ({len(errors)}):"
-        )
+        lines.extend([
+            "",
+            f"Data issues ({len(errors)}):",
+            *errors[:10],
+        ])
 
-        report.extend(errors[:15])
-
-        if len(errors) > 15:
-            report.append(
-                f"...and {len(errors) - 15} more data issues."
+        if len(errors) > 10:
+            lines.append(
+                f"...and {len(errors) - 10} more data issues."
             )
 
-    return "\n".join(report)
+    if manual_mode:
+        lines.extend([
+            "",
+            "🔒 Manual mode: No trades were executed "
+            "and the portfolio was not modified.",
+        ])
+
+    return "\n".join(lines)
 
 
 # ============================================================
-# 17. MAIN AGENT
+# 13. MAIN WORKFLOW
 # ============================================================
 
 def main():
     manual_mode = (
-        os.getenv("GITHUB_EVENT_NAME")
+        os.getenv("GITHUB_EVENT_NAME", "").lower()
         == "workflow_dispatch"
     )
 
-    print("=" * 60)
-    print("INTRADAY GENAI PAPER-TRADING AGENT")
-    print("Time:", now_ist().isoformat())
-    print("Manual mode:", manual_mode)
-    print("=" * 60)
-
-    # Scheduled runs are restricted to market hours.
     if not manual_mode and not is_market_hours():
-        message = (
-            "⏸️ Scheduled agent skipped.\n"
-            f"Current time: "
-            f"{now_ist().strftime('%d-%b-%Y %I:%M %p IST')}\n"
-            "Outside configured NSE market hours."
+        print(
+            "Outside market hours. Scheduled execution skipped."
         )
-
-        print(message)
-        send_telegram(message)
         return
 
-    # Manual mode reads the portfolio only.
-    # It does not reset or save the portfolio.
+    print(
+        "Starting Intraday GenAI Paper Trading Agent."
+    )
+
+    print(
+        "Mode:",
+        "MANUAL ANALYSIS" if manual_mode
+        else "SCHEDULED PAPER TRADING",
+    )
+
     portfolio = load_portfolio(
         reset_daily_budget=not manual_mode
     )
 
-    symbols = load_stock_universe(portfolio)
+    symbols = get_stock_universe()
 
-    print(f"Stocks selected for scan: {len(symbols)}")
+    # Always include existing holdings for risk checks.
+    for symbol in portfolio["holdings"]:
+        if symbol not in symbols:
+            symbols.append(symbol)
+
+    print(
+        f"Collecting market data for {len(symbols)} stocks."
+    )
 
     market_data, errors = collect_market_data(
-        symbols=symbols,
-        manual_mode=manual_mode,
+        symbols,
+        manual_mode,
     )
 
     if not market_data:
-        report = build_report(
-            manual_mode=manual_mode,
-            market_data=market_data,
-            errors=errors,
+        raise RuntimeError(
+            "No valid market data was collected. "
+            + "; ".join(errors[:5])
         )
 
-        report += (
-            "\n\nNo valid market data was available. "
-            "No AI decisions or paper trades were made."
-        )
-
-        print(report)
-        send_telegram(report)
-        return
-
-    # --------------------------------------------------------
-    # MANUAL MODE: ANALYSIS ONLY
-    # --------------------------------------------------------
-
+    # Manual workflow_dispatch is strictly read-only.
     if manual_mode:
-        try:
-            ai_result = gemini_decisions(
-                market_data=market_data,
-                portfolio=portfolio,
-                manual_mode=True,
-            )
-
-            decisions = validate_decisions(
-                ai_result=ai_result,
-                market_data=market_data,
-                portfolio=portfolio,
-            )
-
-            report = build_report(
-                manual_mode=True,
-                market_data=market_data,
-                errors=errors,
-                ai_result=ai_result,
-                decisions=decisions,
-            )
-
-            report += (
-                "\n\n🔒 Manual mode: No trades were executed "
-                "and the portfolio was not modified."
-            )
-
-            print(report)
-            send_telegram(report)
-
-        except Exception as exc:
-            report = build_report(
-                manual_mode=True,
-                market_data=market_data,
-                errors=errors,
-            )
-
-            report += (
-                f"\n\n⚠️ Gemini analysis failed: "
-                f"{str(exc)[:700]}"
-                "\nNo trades were executed and the portfolio "
-                "was not modified."
-            )
-
-            print(report)
-            send_telegram(report)
-
-        return
-
-    # --------------------------------------------------------
-    # SCHEDULED MODE: INDEPENDENT RISK CHECKS FIRST
-    # --------------------------------------------------------
-
-    exited_symbols, risk_messages = (
-        run_independent_exit_checks(
-            portfolio=portfolio,
-            market_data=market_data,
+        print(
+            "Manual analysis mode: portfolio will not be modified."
         )
-    )
 
-    # Persist any daily budget reset and the state after exits.
-    # The SELL transactions themselves are already committed
-    # atomically by execute_paper_trade.
-    save_portfolio(portfolio)
-
-    # --------------------------------------------------------
-    # GEMINI ANALYSIS
-    # --------------------------------------------------------
-
-    try:
-        ai_result = gemini_decisions(
-            market_data=market_data,
-            portfolio=portfolio,
-            manual_mode=False,
+        ai_result = call_gemini(
+            market_data,
+            portfolio,
         )
 
         decisions = validate_decisions(
-            ai_result=ai_result,
-            market_data=market_data,
-            portfolio=portfolio,
+            ai_result,
+            market_data,
+            portfolio,
         )
 
-    except Exception as exc:
         report = build_report(
-            manual_mode=False,
+            manual_mode=True,
             market_data=market_data,
             errors=errors,
-            risk_messages=risk_messages,
-        )
-
-        report += (
-            f"\n\n⚠️ Gemini analysis failed: "
-            f"{str(exc)[:700]}"
-            "\nNew AI-driven trades were skipped. "
-            "Independent risk checks above were still performed."
+            ai_result=ai_result,
+            decisions=decisions,
         )
 
         print(report)
         send_telegram(report)
         return
 
-    # --------------------------------------------------------
-    # EXECUTE VALIDATED AI DECISIONS
-    # --------------------------------------------------------
+    # Scheduled mode: independent exits happen before Gemini.
+    risk_messages = run_independent_exit_checks(
+        portfolio,
+        market_data,
+    )
+
+    # Reload the portfolio after database trade transactions.
+    # This ensures subsequent AI decisions use current holdings.
+    portfolio = load_portfolio(
+        reset_daily_budget=False
+    )
+
+    # Gemini failure must not prevent risk checks from running.
+    try:
+        ai_result = call_gemini(
+            market_data,
+            portfolio,
+        )
+
+        decisions = validate_decisions(
+            ai_result,
+            market_data,
+            portfolio,
+        )
+
+    except Exception as exc:
+        error_message = (
+            f"Gemini analysis failed; no new AI trades will be "
+            f"executed. Risk checks have already run. "
+            f"Error: {str(exc)[:200]}"
+        )
+
+        print(error_message)
+
+        report = (
+            "⚠️ INTRADAY GENAI AGENT\n"
+            f"Time: {now_ist().strftime('%d-%b-%Y %I:%M %p IST')}\n\n"
+            f"{error_message}\n\n"
+            + "\n".join(risk_messages)
+        )
+
+        send_telegram(report)
+        return
 
     execution_messages = []
 
-    for symbol, decision in decisions.items():
-        if symbol in exited_symbols:
+    current_time = now_ist().time()
+
+    # Do not open new positions near the end of the session.
+    allow_new_buys = current_time < NO_NEW_BUYS_AFTER
+
+    for decision in decisions:
+        symbol = decision["symbol"]
+        action = decision["decision"]
+
+        if symbol not in market_data:
             continue
 
-        action = decision["action"]
-        market = market_data.get(symbol)
-
-        if not market:
-            continue
-
-        price = float(market["price"])
+        price = float(market_data[symbol]["price"])
         reason = decision["reason"]
 
         if action == "SELL":
@@ -1476,21 +1462,28 @@ def main():
                     )
 
         elif action == "BUY":
+            if not allow_new_buys:
+                execution_messages.append(
+                    f"{symbol}: BUY skipped; new positions "
+                    "are disabled after 15:00 IST."
+                )
+                continue
+
             if symbol not in portfolio["holdings"]:
                 success, result_message = execute_buy(
                     portfolio=portfolio,
                     symbol=symbol,
                     price=price,
                     reason=reason,
-                    confidence=decision["confidence"],
+                    confidence=decision["signal_score"],
                 )
 
                 execution_messages.append(
                     f"{symbol}: {result_message}"
                 )
 
-    # The trade transactions have already updated Supabase.
-    # Do not overwrite the transaction result with a second
+    # Trade transactions have already updated Supabase.
+    # Do not overwrite the transaction result with another
     # portfolio save after BUY/SELL execution.
 
     report = build_report(
@@ -1515,7 +1508,7 @@ def main():
 
 
 # ============================================================
-# 18. ERROR HANDLING
+# 14. ERROR HANDLING
 # ============================================================
 
 if __name__ == "__main__":
@@ -1533,4 +1526,4 @@ if __name__ == "__main__":
 
         print(error_message)
         send_telegram(error_message)
-        raise   
+        raise
