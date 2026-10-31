@@ -1,7 +1,3 @@
-# ============================================================
-# 1. CONFIGURATION
-# ============================================================
-
 import os
 import json
 import time
@@ -14,6 +10,11 @@ import pandas as pd
 import yfinance as yf
 import requests
 from supabase import create_client
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -75,6 +76,7 @@ def today_ist():
 
 def is_market_hours():
     current = now_ist()
+
     return (
         current.weekday() < 5
         and MARKET_OPEN <= current.time() <= MARKET_CLOSE
@@ -106,6 +108,7 @@ def send_telegram(message):
                 },
                 timeout=15,
             ).raise_for_status()
+
         except Exception as exc:
             print(f"Telegram notification failed: {exc}")
 
@@ -166,14 +169,17 @@ def normalise_holdings(raw_holdings):
         except (TypeError, ValueError):
             continue
 
-        if quantity > 0 and average_price > 0:
-            normalized_symbol = str(symbol).strip().upper()
+        normalized_symbol = str(symbol).strip().upper()
 
-            if normalized_symbol:
-                result[normalized_symbol] = {
-                    "quantity": quantity,
-                    "average_price": average_price,
-                }
+        if (
+            quantity > 0
+            and average_price > 0
+            and normalized_symbol
+        ):
+            result[normalized_symbol] = {
+                "quantity": quantity,
+                "average_price": average_price,
+            }
 
     return result
 
@@ -257,7 +263,11 @@ def load_stock_universe(portfolio):
         raise RuntimeError("nse_stocks.csv is empty.")
 
     possible_columns = [
-        "symbol", "Symbol", "SYMBOL", "ticker", "Ticker"
+        "symbol",
+        "Symbol",
+        "SYMBOL",
+        "ticker",
+        "Ticker",
     ]
 
     symbol_column = next(
@@ -303,6 +313,7 @@ def load_stock_universe(portfolio):
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
+
     gains = delta.clip(lower=0)
     losses = -delta.clip(upper=0)
 
@@ -364,7 +375,12 @@ def download_intraday(symbol, manual_mode):
 
         df = clean_yfinance_columns(df)
 
-        required_columns = ["Close", "High", "Low", "Volume"]
+        required_columns = [
+            "Close",
+            "High",
+            "Low",
+            "Volume",
+        ]
 
         if not all(
             column in df.columns
@@ -375,7 +391,11 @@ def download_intraday(symbol, manual_mode):
             )
 
         df = df[required_columns].copy()
-        df = df.dropna(subset=["Close", "High", "Low"])
+
+        df = df.dropna(
+            subset=["Close", "High", "Low"]
+        )
+
         df = df[df["Close"] > 0]
 
         if df.empty:
@@ -520,9 +540,7 @@ def collect_market_data(symbols, manual_mode):
                 )
 
     return market_data, errors
-
-
-# ============================================================
+ # ============================================================
 # 7. GEMINI RESPONSE PARSING
 # ============================================================
 
@@ -753,6 +771,7 @@ Return valid JSON only:
 
 def validate_decisions(ai_result, market_data, portfolio):
     validated = {}
+
     raw_decisions = ai_result.get("ranked_stocks", [])
 
     if not isinstance(raw_decisions, list):
@@ -785,6 +804,7 @@ def validate_decisions(ai_result, market_data, portfolio):
             score = 0
 
         score = max(0, min(100, score))
+
         data = market_data[symbol]
 
         if action == "BUY":
@@ -845,7 +865,7 @@ def validate_decisions(ai_result, market_data, portfolio):
 
 
 # ============================================================
-# 11. TRADE HISTORY + DUPLICATE PROTECTION
+# 11. TRADE HISTORY AND DUPLICATE PROTECTION
 # ============================================================
 
 def get_todays_trades():
@@ -866,7 +886,12 @@ def get_todays_trades():
 
 def create_idempotency_key(symbol, action):
     trade_date = today_ist().isoformat()
-    return f"{trade_date}:{action.upper()}:{symbol.upper()}"
+
+    return (
+        f"{trade_date}:"
+        f"{action.upper()}:"
+        f"{symbol.upper()}"
+    )
 
 
 def trade_already_recorded(symbol, action):
@@ -883,39 +908,54 @@ def trade_already_recorded(symbol, action):
     return bool(response.data)
 
 
-def record_trade(
+# ============================================================
+# 12. DATABASE TRANSACTION EXECUTION
+# ============================================================
+
+def execute_database_trade(
     symbol,
     action,
     quantity,
     price,
-    pnl,
     reason,
 ):
-    key = create_idempotency_key(symbol, action)
+    """
+    Executes the trade and portfolio update together
+    using the PostgreSQL execute_paper_trade function.
+    """
 
-    if trade_already_recorded(symbol, action):
+    response = supabase.rpc(
+        "execute_paper_trade",
+        {
+            "p_symbol": symbol,
+            "p_action": action,
+            "p_quantity": int(quantity),
+            "p_price": float(price),
+            "p_reason": str(reason)[:500],
+        },
+    ).execute()
+
+    result = response.data
+
+    if isinstance(result, list) and result:
+        result = result[0]
+
+    if not isinstance(result, dict):
         raise RuntimeError(
-            f"Duplicate trade blocked: {key}"
+            f"Unexpected database response: {result}"
         )
 
-    record = {
-        "trade_time": now_ist().isoformat(),
-        "symbol": symbol,
-        "action": action,
-        "quantity": int(quantity),
-        "price": round(float(price), 2),
-        "trade_value": round(quantity * price, 2),
-        "pnl": round(float(pnl), 2),
-        "reason": reason[:500],
-        "idempotency_key": key,
-    }
+    if not result.get("success"):
+        raise RuntimeError(
+            result.get(
+                "message",
+                "Database did not confirm the trade.",
+            )
+        )
 
-    supabase.table("paper_trades").insert(record).execute()
-    return record
-
-
-# ============================================================
-# 12. PAPER SELL
+    return result   
+ # ============================================================
+# 13. PAPER SELL — ATOMIC DATABASE TRANSACTION
 # ============================================================
 
 def execute_sell(portfolio, symbol, price, reason):
@@ -931,36 +971,43 @@ def execute_sell(portfolio, symbol, price, reason):
     quantity = int(holding["quantity"])
     average_price = float(holding["average_price"])
 
-    proceeds = quantity * price
+    if price <= 0 or quantity <= 0:
+        return False
+
     pnl = (price - average_price) * quantity
 
-    portfolio["cash_balance"] += proceeds
-    del portfolio["holdings"][symbol]
+    try:
+        result = execute_database_trade(
+            symbol=symbol,
+            action="SELL",
+            quantity=quantity,
+            price=price,
+            reason=reason,
+        )
 
-    record_trade(
-        symbol=symbol,
-        action="SELL",
-        quantity=quantity,
-        price=price,
-        pnl=pnl,
-        reason=reason,
-    )
+        # Update local state only after database confirmation.
+        portfolio["cash_balance"] += quantity * price
+        del portfolio["holdings"][symbol]
 
-    save_portfolio(portfolio)
+        send_telegram(
+            f"📤 PAPER SELL: {symbol}\n"
+            f"Quantity: {quantity}\n"
+            f"Simulated price: ₹{price:.2f}\n"
+            f"Realised P&L: ₹{pnl:.2f}\n"
+            f"Reason: {reason}"
+        )
 
-    send_telegram(
-        f"📤 PAPER SELL: {symbol}\n"
-        f"Quantity: {quantity}\n"
-        f"Simulated price: ₹{price:.2f}\n"
-        f"Realised P&L: ₹{pnl:.2f}\n"
-        f"Reason: {reason}"
-    )
+        print(f"Atomic SELL completed: {result}")
 
-    return True
+        return True
+
+    except Exception as exc:
+        print(f"Atomic SELL failed for {symbol}: {exc}")
+        return False
 
 
 # ============================================================
-# 13. PAPER BUY
+# 14. PAPER BUY — ATOMIC DATABASE TRANSACTION
 # ============================================================
 
 def execute_buy(
@@ -1013,41 +1060,53 @@ def execute_buy(
 
     trade_value = quantity * price
 
-    portfolio["cash_balance"] -= trade_value
-    portfolio["daily_spent"] += trade_value
-
-    portfolio["holdings"][symbol] = {
-        "quantity": quantity,
-        "average_price": round(price, 2),
-    }
-
-    record_trade(
-        symbol=symbol,
-        action="BUY",
-        quantity=quantity,
-        price=price,
-        pnl=0,
-        reason=(
-            f"{reason} | Signal score: {confidence}"
-        ),
+    trade_reason = (
+        f"{reason} | Signal score: {confidence}"
     )
 
-    save_portfolio(portfolio)
+    try:
+        result = execute_database_trade(
+            symbol=symbol,
+            action="BUY",
+            quantity=quantity,
+            price=price,
+            reason=trade_reason,
+        )
 
-    send_telegram(
-        f"📥 PAPER BUY: {symbol}\n"
-        f"Quantity: {quantity}\n"
-        f"Simulated price: ₹{price:.2f}\n"
-        f"Trade value: ₹{trade_value:.2f}\n"
-        f"Signal score: {confidence}/100\n"
-        f"Reason: {reason}"
-    )
+        # Update local state only after database confirmation.
+        portfolio["cash_balance"] -= trade_value
+        portfolio["daily_spent"] += trade_value
 
-    return True, "BUY executed in paper portfolio."
+        portfolio["holdings"][symbol] = {
+            "quantity": quantity,
+            "average_price": round(price, 2),
+        }
+
+        send_telegram(
+            f"📥 PAPER BUY: {symbol}\n"
+            f"Quantity: {quantity}\n"
+            f"Simulated price: ₹{price:.2f}\n"
+            f"Trade value: ₹{trade_value:.2f}\n"
+            f"Signal score: {confidence}/100\n"
+            f"Reason: {reason}"
+        )
+
+        print(f"Atomic BUY completed: {result}")
+
+        return True, (
+            "BUY executed through atomic database transaction."
+        )
+
+    except Exception as exc:
+        print(f"Atomic BUY failed for {symbol}: {exc}")
+
+        return False, (
+            f"Database transaction failed: {str(exc)[:200]}"
+        )
 
 
 # ============================================================
-# 14. INDEPENDENT RISK CHECKS
+# 15. INDEPENDENT RISK CHECKS
 # ============================================================
 
 def run_independent_exit_checks(
@@ -1058,7 +1117,10 @@ def run_independent_exit_checks(
     messages = []
 
     current_time = now_ist().time()
-    square_off_due = current_time >= SQUARE_OFF_AFTER
+
+    square_off_due = (
+        current_time >= SQUARE_OFF_AFTER
+    )
 
     for symbol in list(portfolio["holdings"].keys()):
         market = market_data.get(symbol)
@@ -1071,6 +1133,7 @@ def run_independent_exit_checks(
             continue
 
         price = float(market["price"])
+
         holding = portfolio["holdings"].get(symbol)
 
         if not holding:
@@ -1098,6 +1161,7 @@ def run_independent_exit_checks(
                 reason,
             ):
                 exited_symbols.add(symbol)
+
                 messages.append(
                     f"{symbol}: Sold by independent stop-loss rule."
                 )
@@ -1114,6 +1178,7 @@ def run_independent_exit_checks(
                 reason,
             ):
                 exited_symbols.add(symbol)
+
                 messages.append(
                     f"{symbol}: Sold by end-of-day square-off."
                 )
@@ -1122,7 +1187,7 @@ def run_independent_exit_checks(
 
 
 # ============================================================
-# 15. TELEGRAM ANALYSIS REPORT
+# 16. TELEGRAM ANALYSIS REPORT
 # ============================================================
 
 def build_report(
@@ -1209,7 +1274,7 @@ def build_report(
 
 
 # ============================================================
-# 16. MAIN AGENT
+# 17. MAIN AGENT
 # ============================================================
 
 def main():
@@ -1224,6 +1289,7 @@ def main():
     print("Manual mode:", manual_mode)
     print("=" * 60)
 
+    # Scheduled runs are restricted to market hours.
     if not manual_mode and not is_market_hours():
         message = (
             "⏸️ Scheduled agent skipped.\n"
@@ -1236,6 +1302,8 @@ def main():
         send_telegram(message)
         return
 
+    # Manual mode reads the portfolio only.
+    # It does not reset or save the portfolio.
     portfolio = load_portfolio(
         reset_daily_budget=not manual_mode
     )
@@ -1265,7 +1333,10 @@ def main():
         send_telegram(report)
         return
 
+    # --------------------------------------------------------
     # MANUAL MODE: ANALYSIS ONLY
+    # --------------------------------------------------------
+
     if manual_mode:
         try:
             ai_result = gemini_decisions(
@@ -1315,7 +1386,10 @@ def main():
 
         return
 
+    # --------------------------------------------------------
     # SCHEDULED MODE: INDEPENDENT RISK CHECKS FIRST
+    # --------------------------------------------------------
+
     exited_symbols, risk_messages = (
         run_independent_exit_checks(
             portfolio=portfolio,
@@ -1323,9 +1397,15 @@ def main():
         )
     )
 
+    # Persist any daily budget reset and the state after exits.
+    # The SELL transactions themselves are already committed
+    # atomically by execute_paper_trade.
     save_portfolio(portfolio)
 
+    # --------------------------------------------------------
     # GEMINI ANALYSIS
+    # --------------------------------------------------------
+
     try:
         ai_result = gemini_decisions(
             market_data=market_data,
@@ -1358,7 +1438,10 @@ def main():
         send_telegram(report)
         return
 
+    # --------------------------------------------------------
     # EXECUTE VALIDATED AI DECISIONS
+    # --------------------------------------------------------
+
     execution_messages = []
 
     for symbol, decision in decisions.items():
@@ -1387,6 +1470,10 @@ def main():
                     execution_messages.append(
                         f"{symbol}: AI SELL executed."
                     )
+                else:
+                    execution_messages.append(
+                        f"{symbol}: AI SELL not executed."
+                    )
 
         elif action == "BUY":
             if symbol not in portfolio["holdings"]:
@@ -1402,7 +1489,9 @@ def main():
                     f"{symbol}: {result_message}"
                 )
 
-    save_portfolio(portfolio)
+    # The trade transactions have already updated Supabase.
+    # Do not overwrite the transaction result with a second
+    # portfolio save after BUY/SELL execution.
 
     report = build_report(
         manual_mode=False,
@@ -1426,7 +1515,7 @@ def main():
 
 
 # ============================================================
-# 17. ERROR HANDLING
+# 18. ERROR HANDLING
 # ============================================================
 
 if __name__ == "__main__":
@@ -1444,4 +1533,4 @@ if __name__ == "__main__":
 
         print(error_message)
         send_telegram(error_message)
-        raise
+        raise   
