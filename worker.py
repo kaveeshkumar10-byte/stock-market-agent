@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -130,6 +129,16 @@ def empty_portfolio():
 
 
 def normalise_holdings(raw_holdings):
+    """
+    Accept holdings written by both app.py and worker.py.
+
+    app.py format:
+        quantity, entry_price, average_price, entry_time
+
+    worker.py format:
+        quantity, average_price
+    """
+
     if isinstance(raw_holdings, str):
         try:
             raw_holdings = json.loads(raw_holdings)
@@ -150,18 +159,34 @@ def normalise_holdings(raw_holdings):
                 item.get("quantity", item.get("qty", 0))
             )
 
-            average_price = float(
-                item.get(
-                    "average_price",
-                    item.get("avg_price", item.get("buy_price", 0)),
-                )
-            )
+            # Support both dashboard and worker price fields.
+            average_price = 0.0
+
+            for candidate in (
+                item.get("average_price"),
+                item.get("entry_price"),
+                item.get("avg_price"),
+                item.get("buy_price"),
+            ):
+                if candidate is None:
+                    continue
+
+                candidate_price = float(candidate)
+
+                if candidate_price > 0:
+                    average_price = candidate_price
+                    break
 
         except (TypeError, ValueError):
             continue
 
         if quantity > 0 and average_price > 0:
-            result[symbol] = {
+            normalized_symbol = str(symbol).strip().upper()
+
+            if not normalized_symbol:
+                continue
+
+            result[normalized_symbol] = {
                 "quantity": quantity,
                 "average_price": average_price,
             }
@@ -279,11 +304,10 @@ def load_stock_universe(portfolio):
         if symbol not in all_symbols:
             all_symbols.append(symbol)
 
-    # IMPORTANT:
     # Only the first MAX_STOCKS stocks are selected.
     selected_symbols = all_symbols[:MAX_STOCKS]
 
-    # Include all existing holdings, even if they are outside
+    # Include existing holdings even if they are outside
     # the first 20 stocks in the CSV.
     for symbol in portfolio["holdings"]:
         if symbol not in selected_symbols:
@@ -720,8 +744,7 @@ Return valid JSON only:
         "x-goog-api-key": GEMINI_API_KEY,
     }
 
-    # Do not retry HTTP 429. Repeating the same request
-    # will not fix an exhausted quota.
+    # Do not retry HTTP 429.
     for attempt in range(2):
         try:
             response = requests.post(
@@ -734,9 +757,8 @@ Return valid JSON only:
             if response.status_code == 429:
                 raise RuntimeError(
                     "Gemini free-tier quota exceeded (HTTP 429). "
-                    "The stock list has now been limited and the "
-                    "request payload reduced. Check your Gemini API "
-                    "quota and try again after it resets."
+                    "Check your Gemini API quota and try again "
+                    "after it resets."
                 )
 
             if response.status_code >= 400:
