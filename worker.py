@@ -1,3 +1,7 @@
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
 import os
 import json
 import time
@@ -10,11 +14,6 @@ import pandas as pd
 import yfinance as yf
 import requests
 from supabase import create_client
-
-
-# ============================================================
-# 1. CONFIGURATION
-# ============================================================
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -76,7 +75,6 @@ def today_ist():
 
 def is_market_hours():
     current = now_ist()
-
     return (
         current.weekday() < 5
         and MARKET_OPEN <= current.time() <= MARKET_CLOSE
@@ -108,7 +106,6 @@ def send_telegram(message):
                 },
                 timeout=15,
             ).raise_for_status()
-
         except Exception as exc:
             print(f"Telegram notification failed: {exc}")
 
@@ -129,16 +126,6 @@ def empty_portfolio():
 
 
 def normalise_holdings(raw_holdings):
-    """
-    Accept holdings written by both app.py and worker.py.
-
-    app.py format:
-        quantity, entry_price, average_price, entry_time
-
-    worker.py format:
-        quantity, average_price
-    """
-
     if isinstance(raw_holdings, str):
         try:
             raw_holdings = json.loads(raw_holdings)
@@ -159,7 +146,6 @@ def normalise_holdings(raw_holdings):
                 item.get("quantity", item.get("qty", 0))
             )
 
-            # Support both dashboard and worker price fields.
             average_price = 0.0
 
             for candidate in (
@@ -183,13 +169,11 @@ def normalise_holdings(raw_holdings):
         if quantity > 0 and average_price > 0:
             normalized_symbol = str(symbol).strip().upper()
 
-            if not normalized_symbol:
-                continue
-
-            result[normalized_symbol] = {
-                "quantity": quantity,
-                "average_price": average_price,
-            }
+            if normalized_symbol:
+                result[normalized_symbol] = {
+                    "quantity": quantity,
+                    "average_price": average_price,
+                }
 
     return result
 
@@ -233,7 +217,6 @@ def load_portfolio(reset_daily_budget=False):
     ):
         portfolio["daily_spent"] = 0.0
         portfolio["last_budget_reset"] = str(today_ist())
-
         save_portfolio(portfolio)
 
     return portfolio
@@ -274,11 +257,7 @@ def load_stock_universe(portfolio):
         raise RuntimeError("nse_stocks.csv is empty.")
 
     possible_columns = [
-        "symbol",
-        "Symbol",
-        "SYMBOL",
-        "ticker",
-        "Ticker",
+        "symbol", "Symbol", "SYMBOL", "ticker", "Ticker"
     ]
 
     symbol_column = next(
@@ -304,11 +283,8 @@ def load_stock_universe(portfolio):
         if symbol not in all_symbols:
             all_symbols.append(symbol)
 
-    # Only the first MAX_STOCKS stocks are selected.
     selected_symbols = all_symbols[:MAX_STOCKS]
 
-    # Include existing holdings even if they are outside
-    # the first 20 stocks in the CSV.
     for symbol in portfolio["holdings"]:
         if symbol not in selected_symbols:
             selected_symbols.append(symbol)
@@ -327,7 +303,6 @@ def load_stock_universe(portfolio):
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
-
     gains = delta.clip(lower=0)
     losses = -delta.clip(upper=0)
 
@@ -389,12 +364,7 @@ def download_intraday(symbol, manual_mode):
 
         df = clean_yfinance_columns(df)
 
-        required_columns = [
-            "Close",
-            "High",
-            "Low",
-            "Volume",
-        ]
+        required_columns = ["Close", "High", "Low", "Volume"]
 
         if not all(
             column in df.columns
@@ -405,11 +375,7 @@ def download_intraday(symbol, manual_mode):
             )
 
         df = df[required_columns].copy()
-
-        df = df.dropna(
-            subset=["Close", "High", "Low"]
-        )
-
+        df = df.dropna(subset=["Close", "High", "Low"])
         df = df[df["Close"] > 0]
 
         if df.empty:
@@ -424,7 +390,6 @@ def download_intraday(symbol, manual_mode):
 
         df.index = index.tz_convert(IST)
 
-        # Calculate EMAs and RSI on downloaded history.
         df["EMA9"] = df["Close"].ewm(
             span=9,
             adjust=False,
@@ -437,8 +402,6 @@ def download_intraday(symbol, manual_mode):
 
         df["RSI"] = calculate_rsi(df["Close"])
 
-        # Manual analysis can use the latest available session.
-        # Scheduled trading uses today's session only.
         if manual_mode:
             session_date = df.index[-1].date()
         else:
@@ -459,7 +422,6 @@ def download_intraday(symbol, manual_mode):
                 f"for {session_date}; at least {MIN_CANDLES} required."
             )
 
-        # Calculate VWAP for the selected session.
         typical_price = (
             session_df["High"]
             + session_df["Low"]
@@ -595,11 +557,6 @@ def extract_json(text):
 # ============================================================
 
 def create_compact_market_data(market_data):
-    """
-    Only send fields Gemini needs.
-    This reduces unnecessary input tokens.
-    """
-
     compact_data = []
 
     for item in market_data.values():
@@ -744,7 +701,6 @@ Return valid JSON only:
         "x-goog-api-key": GEMINI_API_KEY,
     }
 
-    # Do not retry HTTP 429.
     for attempt in range(2):
         try:
             response = requests.post(
@@ -797,7 +753,6 @@ Return valid JSON only:
 
 def validate_decisions(ai_result, market_data, portfolio):
     validated = {}
-
     raw_decisions = ai_result.get("ranked_stocks", [])
 
     if not isinstance(raw_decisions, list):
@@ -830,10 +785,8 @@ def validate_decisions(ai_result, market_data, portfolio):
             score = 0
 
         score = max(0, min(100, score))
-
         data = market_data[symbol]
 
-        # Python independently validates BUY conditions.
         if action == "BUY":
             if (
                 score < MIN_BUY_SCORE
@@ -846,7 +799,6 @@ def validate_decisions(ai_result, market_data, portfolio):
             ):
                 action = "HOLD"
 
-        # SELL only if the stock is already held.
         if (
             action == "SELL"
             and symbol not in portfolio["holdings"]
@@ -870,7 +822,6 @@ def validate_decisions(ai_result, market_data, portfolio):
             "rank": rank,
         }
 
-    # Any stock omitted by Gemini defaults to HOLD.
     for symbol in market_data:
         if symbol not in validated:
             validated[symbol] = {
@@ -880,7 +831,6 @@ def validate_decisions(ai_result, market_data, portfolio):
                 "rank": 999,
             }
 
-    # Sort by Gemini rank and then signal score.
     validated = dict(
         sorted(
             validated.items(),
@@ -895,7 +845,7 @@ def validate_decisions(ai_result, market_data, portfolio):
 
 
 # ============================================================
-# 11. TRADE HISTORY
+# 11. TRADE HISTORY + DUPLICATE PROTECTION
 # ============================================================
 
 def get_todays_trades():
@@ -914,6 +864,25 @@ def get_todays_trades():
     return response.data or []
 
 
+def create_idempotency_key(symbol, action):
+    trade_date = today_ist().isoformat()
+    return f"{trade_date}:{action.upper()}:{symbol.upper()}"
+
+
+def trade_already_recorded(symbol, action):
+    key = create_idempotency_key(symbol, action)
+
+    response = (
+        supabase.table("paper_trades")
+        .select("idempotency_key")
+        .eq("idempotency_key", key)
+        .limit(1)
+        .execute()
+    )
+
+    return bool(response.data)
+
+
 def record_trade(
     symbol,
     action,
@@ -922,6 +891,13 @@ def record_trade(
     pnl,
     reason,
 ):
+    key = create_idempotency_key(symbol, action)
+
+    if trade_already_recorded(symbol, action):
+        raise RuntimeError(
+            f"Duplicate trade blocked: {key}"
+        )
+
     record = {
         "trade_time": now_ist().isoformat(),
         "symbol": symbol,
@@ -931,10 +907,10 @@ def record_trade(
         "trade_value": round(quantity * price, 2),
         "pnl": round(float(pnl), 2),
         "reason": reason[:500],
+        "idempotency_key": key,
     }
 
     supabase.table("paper_trades").insert(record).execute()
-
     return record
 
 
@@ -948,6 +924,10 @@ def execute_sell(portfolio, symbol, price, reason):
     if not holding:
         return False
 
+    if trade_already_recorded(symbol, "SELL"):
+        print(f"Duplicate SELL blocked for {symbol}.")
+        return False
+
     quantity = int(holding["quantity"])
     average_price = float(holding["average_price"])
 
@@ -955,7 +935,6 @@ def execute_sell(portfolio, symbol, price, reason):
     pnl = (price - average_price) * quantity
 
     portfolio["cash_balance"] += proceeds
-
     del portfolio["holdings"][symbol]
 
     record_trade(
@@ -993,6 +972,9 @@ def execute_buy(
 ):
     if symbol in portfolio["holdings"]:
         return False, "Already holding this stock."
+
+    if trade_already_recorded(symbol, "BUY"):
+        return False, "Duplicate BUY blocked for today."
 
     if now_ist().time() >= NO_NEW_BUYS_AFTER:
         return False, "New BUY cutoff time has passed."
@@ -1076,10 +1058,7 @@ def run_independent_exit_checks(
     messages = []
 
     current_time = now_ist().time()
-
-    square_off_due = (
-        current_time >= SQUARE_OFF_AFTER
-    )
+    square_off_due = current_time >= SQUARE_OFF_AFTER
 
     for symbol in list(portfolio["holdings"].keys()):
         market = market_data.get(symbol)
@@ -1092,7 +1071,6 @@ def run_independent_exit_checks(
             continue
 
         price = float(market["price"])
-
         holding = portfolio["holdings"].get(symbol)
 
         if not holding:
@@ -1120,7 +1098,6 @@ def run_independent_exit_checks(
                 reason,
             ):
                 exited_symbols.add(symbol)
-
                 messages.append(
                     f"{symbol}: Sold by independent stop-loss rule."
                 )
@@ -1137,7 +1114,6 @@ def run_independent_exit_checks(
                 reason,
             ):
                 exited_symbols.add(symbol)
-
                 messages.append(
                     f"{symbol}: Sold by end-of-day square-off."
                 )
@@ -1248,7 +1224,6 @@ def main():
     print("Manual mode:", manual_mode)
     print("=" * 60)
 
-    # Scheduled runs are restricted to market hours.
     if not manual_mode and not is_market_hours():
         message = (
             "⏸️ Scheduled agent skipped.\n"
@@ -1261,8 +1236,6 @@ def main():
         send_telegram(message)
         return
 
-    # Manual mode reads the portfolio only.
-    # It does not reset or save the portfolio.
     portfolio = load_portfolio(
         reset_daily_budget=not manual_mode
     )
@@ -1292,10 +1265,7 @@ def main():
         send_telegram(report)
         return
 
-    # --------------------------------------------------------
     # MANUAL MODE: ANALYSIS ONLY
-    # --------------------------------------------------------
-
     if manual_mode:
         try:
             ai_result = gemini_decisions(
@@ -1345,10 +1315,7 @@ def main():
 
         return
 
-    # --------------------------------------------------------
     # SCHEDULED MODE: INDEPENDENT RISK CHECKS FIRST
-    # --------------------------------------------------------
-
     exited_symbols, risk_messages = (
         run_independent_exit_checks(
             portfolio=portfolio,
@@ -1358,10 +1325,7 @@ def main():
 
     save_portfolio(portfolio)
 
-    # --------------------------------------------------------
     # GEMINI ANALYSIS
-    # --------------------------------------------------------
-
     try:
         ai_result = gemini_decisions(
             market_data=market_data,
@@ -1394,10 +1358,7 @@ def main():
         send_telegram(report)
         return
 
-    # --------------------------------------------------------
     # EXECUTE VALIDATED AI DECISIONS
-    # --------------------------------------------------------
-
     execution_messages = []
 
     for symbol, decision in decisions.items():
@@ -1405,7 +1366,6 @@ def main():
             continue
 
         action = decision["action"]
-
         market = market_data.get(symbol)
 
         if not market:
