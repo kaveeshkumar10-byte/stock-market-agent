@@ -1,0 +1,63 @@
+name: Test Supabase RPC Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-rpc:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Supabase
+        run: pip install supabase
+
+      - name: Test RPC connection safely
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+
+        run: |
+          python - <<'PY'
+          import os
+          from supabase import create_client
+
+          client = create_client(
+              os.environ["SUPABASE_URL"],
+              os.environ["SUPABASE_SECRET_KEY"]
+          )
+
+          print("Supabase client initialized.")
+
+          try:
+              client.rpc(
+                  "execute_paper_trade",
+                  {
+                      "p_symbol": "ZZZ_ATOMIC_TEST",
+                      "p_action": "INVALID_TEST",
+                      "p_quantity": 1,
+                      "p_price": 1.00,
+                      "p_reason": "Safe RPC connectivity test"
+                  }
+              ).execute()
+
+              raise RuntimeError(
+                  "Unexpected result: invalid action was accepted."
+              )
+
+          except Exception as exc:
+              error = str(exc)
+
+              if "Invalid trade action" in error:
+                  print("SUCCESS: Python reached the RPC function.")
+                  print("SUCCESS: Database rejected invalid action.")
+                  print("SUCCESS: No trade was executed.")
+              else:
+                  raise RuntimeError(
+                      f"RPC test failed: {error}"
+                  ) from exc
+          PY
