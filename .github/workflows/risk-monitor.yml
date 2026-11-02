@@ -1,0 +1,40 @@
+name: Intraday GenAI Risk Monitor
+
+on:
+  # Keep stop-loss and square-off checks frequent, independently of the
+  # longer hourly full-universe scan. UTC 03:00-09:45 = IST 08:30-15:15.
+  schedule:
+    - cron: "*/15 3-9 * * 1-5"
+
+concurrency:
+  group: intraday-risk-monitor
+  cancel-in-progress: false
+
+jobs:
+  risk-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install streamlit pandas numpy plotly yfinance requests supabase pandas-market-calendars==5.3.2
+
+      - name: Run independent risk checks only
+        env:
+          AGENT_MODE: risk_only
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python worker.py
