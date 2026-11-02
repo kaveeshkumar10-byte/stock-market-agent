@@ -693,7 +693,7 @@ def collect_market_data(symbols, manual_mode, held_symbols=None):
     errors = []
     held_symbols = set(held_symbols or [])
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
             executor.submit(download_intraday, symbol, manual_mode): symbol
             for symbol in symbols
