@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import yfinance as yf
 import requests
-import pandas_market_calendars as mcal
 from supabase import create_client
 
 
@@ -19,11 +18,10 @@ from supabase import create_client
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# Offline NSE calendar supplied by pandas_market_calendars.
-# This avoids runtime requests to NSE, which may return HTTP 403
-# from cloud-hosted GitHub Actions runners.
+# NSE official holiday endpoint (cash/equities segment = CM).
+NSE_HOME_URL = "https://www.nseindia.com/"
+NSE_HOLIDAY_API = "https://www.nseindia.com/api/holiday-master"
 _NSE_HOLIDAY_CACHE = {}
-SUPPORTED_NSE_CALENDAR_YEARS = {2026, 2027}
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_URL = (
@@ -83,13 +81,16 @@ def today_ist():
 
 def fetch_nse_holidays(year):
     """
-    Return NSE weekday holidays from the locally installed XNSE calendar.
-
-    Calendar data is bundled with pandas_market_calendars, so this function
-    does not make an HTTP request to NSE at runtime. The package version is
-    pinned in the GitHub Actions workflow. Fail closed for unsupported years.
+    Fetch official NSE cash-market (CM) trading holidays.
+    NSE's web endpoint is not a documented public API and may change.
+    Any fetch/parse failure raises an exception (fail closed).
+    Results are cached for this worker process.
     """
     year = int(year)
 
     if year in _NSE_HOLIDAY_CACHE:
         return _NSE_HOLIDAY_CACHE[year]
+
+    session = requests.Session()
+
+    headers = {
