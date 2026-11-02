@@ -43,8 +43,15 @@ NO_NEW_BUYS_AFTER = dt_time(15, 0)
 SQUARE_OFF_AFTER = dt_time(15, 10)
 
 MAX_DATA_AGE_MINUTES = 30
-MAX_STOCKS = 20
 MIN_CANDLES = 10
+
+# Full-universe technical scan once per hour, anchored at 09:15 IST.
+# The GitHub workflow still runs every 15 minutes for independent risk checks.
+FULL_SCAN_INTERVAL_MINUTES = 60
+FULL_SCAN_WINDOW_TOLERANCE_MINUTES = 8
+LAST_FULL_SCAN_HOUR_IST = dt_time(15, 0)
+AI_MAX_CANDIDATES = 100
+DATA_DOWNLOAD_WORKERS = 2
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY")
@@ -481,7 +488,15 @@ def get_stock_universe():
         if symbol not in symbols:
             symbols.append(symbol)
 
-    return symbols[:MAX_STOCKS]
+    if len(symbols) < 1000:
+        raise RuntimeError(
+            f"nse_stocks.csv contains only {len(symbols)} unique symbols. "
+            "The full-universe scan expects a comprehensive NSE equity list. "
+            "Update the CSV before enabling full-universe scans."
+        )
+
+    print(f"Loaded {len(symbols)} unique NSE equity symbols from nse_stocks.csv.")
+    return symbols
 
 
 def download_intraday(symbol, manual_mode=False):
@@ -693,7 +708,7 @@ def collect_market_data(symbols, manual_mode, held_symbols=None):
     errors = []
     held_symbols = set(held_symbols or [])
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=DATA_DOWNLOAD_WORKERS) as executor:
         futures = {
             executor.submit(download_intraday, symbol, manual_mode): symbol
             for symbol in symbols
@@ -739,6 +754,53 @@ def collect_market_data(symbols, manual_mode, held_symbols=None):
                         errors.append(risk_error)
 
     return market_data, errors, risk_data
+
+
+def select_ai_candidates(market_data, holdings, max_candidates=AI_MAX_CANDIDATES):
+    """Pre-screen every scanned stock locally; send only strongest candidates to Gemini."""
+    ranked = []
+    held = set(holdings or {})
+
+    for symbol, data in market_data.items():
+        score = 0
+        price = float(data.get("price", 0) or 0)
+        ema9 = float(data.get("ema9", 0) or 0)
+        ema21 = float(data.get("ema21", 0) or 0)
+        rsi = float(data.get("rsi", 0) or 0)
+        vwap = float(data.get("vwap", 0) or 0)
+        volume = int(data.get("volume", 0) or 0)
+
+        if ema9 > ema21:
+            score += 25
+        if price > vwap:
+            score += 25
+        if 50 <= rsi <= 70:
+            score += 20
+        elif 45 <= rsi < 50:
+            score += 8
+        if volume > 0:
+            score += 10
+        if price > 0 and vwap > 0:
+            score += max(0, min(20, (price / vwap - 1) * 1000))
+
+        # Every current holding is sent to Gemini so potential SELL signals
+        # are not excluded by the BUY-oriented pre-screen.
+        ranked.append((symbol, score, symbol in held))
+
+    ranked.sort(key=lambda item: (not item[2], -item[1], item[0]))
+    selected_symbols = [item[0] for item in ranked[:max_candidates]]
+
+    # Ensure all holdings are included even if holdings exceed shortlist size.
+    for symbol in held:
+        if symbol in market_data and symbol not in selected_symbols:
+            selected_symbols.append(symbol)
+
+    selected = {symbol: market_data[symbol] for symbol in selected_symbols}
+    print(
+        f"Local technical screening completed for {len(market_data)} stocks; "
+        f"sending {len(selected)} candidates (including all available holdings) to Gemini."
+    )
+    return selected
 
 
 # ============================================================
@@ -1480,6 +1542,7 @@ def main():
         os.getenv("GITHUB_EVENT_NAME", "").lower()
         == "workflow_dispatch"
     )
+    risk_only_mode = os.getenv("AGENT_MODE", "").strip().lower() == "risk_only"
 
     # Manual workflow_dispatch validates the holiday calendar but remains
     # read-only: it does not reset budgets or execute portfolio trades.
@@ -1522,6 +1585,35 @@ def main():
             )
             return
 
+    # Dedicated 15-minute risk-monitor workflow. It runs independently from
+    # the hourly full-universe scanner so long scans do not delay risk checks.
+    if risk_only_mode:
+        held_symbols = list(portfolio.get("holdings", {}).keys())
+        if not held_symbols:
+            print("Risk-only cycle: no open holdings; no action required.")
+            return
+
+        print(f"Risk-only cycle: checking {len(held_symbols)} open holdings.")
+        _, risk_errors, risk_data = collect_market_data(
+            held_symbols,
+            manual_mode=False,
+            held_symbols=held_symbols,
+        )
+        risk_messages = run_independent_exit_checks(portfolio, risk_data)
+        lines = [
+            "🛡️ INTRADAY GENAI AGENT — RISK-ONLY CHECK",
+            f"Time: {now_ist().strftime('%d-%b-%Y %I:%M %p IST')}",
+            f"Open holdings checked: {len(held_symbols)}",
+        ]
+        if risk_messages:
+            lines.extend(["", "RISK MANAGEMENT:", *risk_messages])
+        if risk_errors:
+            lines.extend(["", "Data issues:", *risk_errors[:10]])
+        report = "\n".join(lines)
+        print(report)
+        send_telegram(report)
+        return
+
     symbols = get_stock_universe()
 
     # Always include existing holdings for risk checks.
@@ -1530,7 +1622,7 @@ def main():
             symbols.append(symbol)
 
     print(
-        f"Collecting market data for {len(symbols)} stocks."
+        f"Starting FULL NSE universe scan for {len(symbols)} stocks."
     )
 
     market_data, errors, risk_data = collect_market_data(
@@ -1551,15 +1643,24 @@ def main():
             "Manual analysis mode: portfolio will not be modified."
         )
 
-        ai_result = call_gemini(
+        ai_candidates = select_ai_candidates(
             market_data,
+            portfolio.get("holdings", {}),
+        )
+        ai_result = call_gemini(
+            ai_candidates,
             portfolio,
         )
 
         decisions = validate_decisions(
             ai_result,
-            market_data,
+            ai_candidates,
             portfolio,
+        )
+        ai_result["market_view"] = (
+            str(ai_result.get("market_view", ""))
+            + f"\nFull-universe technical scan: {len(market_data)} stocks. "
+            + f"Gemini shortlist: {len(ai_candidates)} candidates."
         )
 
         report = build_report(
@@ -1601,14 +1702,18 @@ def main():
 
     # Gemini failure must not prevent risk checks from running.
     try:
-        ai_result = call_gemini(
+        ai_candidates = select_ai_candidates(
             market_data,
+            portfolio.get("holdings", {}),
+        )
+        ai_result = call_gemini(
+            ai_candidates,
             portfolio,
         )
 
         decisions = validate_decisions(
             ai_result,
-            market_data,
+            ai_candidates,
             portfolio,
         )
 
@@ -1690,6 +1795,12 @@ def main():
     # Trade transactions have already updated Supabase.
     # Do not overwrite the transaction result with another
     # portfolio save after BUY/SELL execution.
+
+    ai_result["market_view"] = (
+        str(ai_result.get("market_view", ""))
+        + f"\nFull-universe technical scan: {len(market_data)} stocks. "
+        + f"Gemini shortlist: {len(ai_candidates)} candidates."
+    )
 
     report = build_report(
         manual_mode=False,
