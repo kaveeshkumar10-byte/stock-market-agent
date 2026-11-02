@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install streamlit pandas numpy plotly yfinance requests supabase
+          pip install streamlit pandas numpy plotly yfinance requests supabase pandas-market-calendars==5.3.2
 
       - name: Run intraday GenAI agent
         env:
